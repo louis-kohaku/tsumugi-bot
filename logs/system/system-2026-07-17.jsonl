@@ -1,0 +1,3 @@
+{"timestamp":"2026-07-17T01:28:23.895353300Z","level":"INFO","component":"SqliteConnectionFactory","message":"sqlite-vec拡張のロードに成功しました"}
+{"timestamp":"2026-07-17T01:28:26.644272600Z","level":"INFO","component":"DiscordAdapter","message":"Discord接続を開始しました"}
+{"timestamp":"2026-07-17T02:30:29.978394Z","level":"INFO","component":"DiscordAdapter","message":"シャットダウンを開始します"}
