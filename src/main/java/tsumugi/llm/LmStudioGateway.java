@@ -140,7 +140,7 @@ public final class LmStudioGateway implements LlmClient, EmbeddingClient {
 
             if (!response.isSuccessful()) {
                 logger.warning("""
-    LM Studio Error
+    LM Studio error
     HTTP: %d
     PATH: %s
 
