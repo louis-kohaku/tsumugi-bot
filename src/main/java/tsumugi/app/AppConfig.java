@@ -2,23 +2,35 @@ package tsumugi.app;
 
 import io.github.cdimascio.dotenv.Dotenv;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Optional;
+import java.util.logging.Logger;
+
 /** .envから読み込んだ設定値をまとめて保持する。 */
 public final class AppConfig {
+
+    private static final Logger logger = Logger.getLogger(AppConfig.class.getName());
+
+    // DBファイルの衝突（同名ファイルで別プロジェクト/別環境のものを誤って開いてしまう事故）を
+    // 避けるため、TSUMUGI_DB_PATH未指定時はこのディレクトリ・接頭辞でファイルを自動管理する。
+    private static final String AUTO_DB_DIR = "data";
+    private static final String AUTO_DB_PREFIX = "tsumugi_";
+    private static final String AUTO_DB_SUFFIX = ".db";
+    private static final DateTimeFormatter TIMESTAMP_FORMAT =
+            DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
 
     public final String discordToken;
     public final String lmStudioBaseUrl;
     public final String lmStudioChatModel;
     public final String lmStudioEmbeddingModel;
-
-    /** 共有DB（initial_setup / withdrawal / membership_events等、運用管理データ用）のパス。 */
     public final String dbPath;
-
-    /**
-     * ユーザーごとの記憶層DB（episodic_events / evidence / evidence_vec / user_model）を
-     * 配置するベースディレクトリ。実際のDBファイルは userDbDir/{userId}/tsumugi.db に作られる。
-     */
-    public final String userDbDir;
-
     public final String sqliteVecExtensionPath;
 
     private AppConfig(Dotenv env) {
@@ -26,9 +38,61 @@ public final class AppConfig {
         this.lmStudioBaseUrl = env.get("LM_STUDIO_BASE_URL", "http://localhost:1234");
         this.lmStudioChatModel = env.get("LM_STUDIO_CHAT_MODEL", "");
         this.lmStudioEmbeddingModel = env.get("LM_STUDIO_EMBEDDING_MODEL", "");
-        this.dbPath = env.get("TSUMUGI_DB_PATH", "data/tsumugi.db");
-        this.userDbDir = env.get("TSUMUGI_USER_DB_DIR", "data/users");
+        this.dbPath = resolveDbPath(env);
         this.sqliteVecExtensionPath = env.get("SQLITE_VEC_EXTENSION_PATH", "");
+    }
+
+    /**
+     * DBファイルパスを決定する。
+     *
+     * 1. .envでTSUMUGI_DB_PATHが明示されていれば、それを最優先でそのまま使う
+     *    （運用者が意図的にパスを指定しているケースなので上書きしない）。
+     * 2. 未指定の場合はdataディレクトリ配下の "tsumugi_*.db" を探し、
+     *    既に存在すれば一番新しいものを再利用する（再起動時に同じDBを開き続けるため）。
+     * 3. どちらも無ければ、今の日時（＝このDBの登録日時）をファイル名に埋め込んだ
+     *    新規ファイル名を生成する。これにより、他のプロジェクト/他環境のDBファイルと
+     *    名前が衝突して開けなくなる事故を防ぐ。
+     */
+    private String resolveDbPath(Dotenv env) {
+        String explicit = env.get("TSUMUGI_DB_PATH", "");
+        if (explicit != null && !explicit.isBlank()) {
+            return explicit;
+        }
+
+        Path dir = Paths.get(AUTO_DB_DIR);
+        Optional<Path> existing = findLatestAutoDbFile(dir);
+        if (existing.isPresent()) {
+            String found = existing.get().toString();
+            logger.info("既存のDBファイルを再利用します: " + found);
+            return found;
+        }
+
+        String timestamp = LocalDateTime.now().format(TIMESTAMP_FORMAT);
+        String generated = Paths.get(AUTO_DB_DIR, AUTO_DB_PREFIX + timestamp + AUTO_DB_SUFFIX).toString();
+        logger.info("DBファイルが見つからなかったため、登録日時ベースの新規ファイル名を生成しました: " + generated);
+        return generated;
+    }
+
+    /** dataディレクトリ内の "tsumugi_*.db" のうち、最終更新日時が最も新しいものを返す。 */
+    private Optional<Path> findLatestAutoDbFile(Path dir) {
+        if (!Files.isDirectory(dir)) {
+            return Optional.empty();
+        }
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(
+                dir, AUTO_DB_PREFIX + "*" + AUTO_DB_SUFFIX)) {
+            Path latest = null;
+            long latestModified = Long.MIN_VALUE;
+            for (Path candidate : stream) {
+                long modified = Files.getLastModifiedTime(candidate).toMillis();
+                if (modified > latestModified) {
+                    latestModified = modified;
+                    latest = candidate;
+                }
+            }
+            return Optional.ofNullable(latest);
+        } catch (IOException e) {
+            throw new UncheckedIOException("dataディレクトリの走査に失敗しました", e);
+        }
     }
 
     public static AppConfig load() {
