@@ -126,23 +126,44 @@ public final class LmStudioGateway implements LlmClient, EmbeddingClient {
 
     private JsonObject post(String path, JsonObject body) {
         RequestBody requestBody = RequestBody.create(body.toString(), JSON);
+
         Request request = new Request.Builder()
                 .url(baseUrl + path)
                 .post(requestBody)
                 .build();
 
         try (Response response = http.newCall(request).execute()) {
-            if (!response.isSuccessful() || response.body() == null) {
-                logger.warning("LM Studio呼び出しが失敗しました: HTTP " + response.code() + " path=" + path);
+
+            String raw = response.body() != null
+                    ? response.body().string()
+                    : "";
+
+            if (!response.isSuccessful()) {
+                logger.warning("""
+    LM Studio error
+    HTTP: %d
+    PATH: %s
+
+    REQUEST:
+    %s
+
+    RESPONSE:
+    %s
+    """.formatted(
+                        response.code(),
+                        path,
+                        body,
+                        raw
+                ));
                 return null;
             }
-            String raw = response.body().string();
+
             return JsonParser.parseString(raw).getAsJsonObject();
         } catch (IOException e) {
-            logger.warning("LM Studioへの接続に失敗しました（起動しているか確認してください）: " + e.getMessage());
+            logger.warning("LM Studioへの接続に失敗しました: " + e.getMessage());
             return null;
         } catch (RuntimeException e) {
-            logger.warning("LM Studio応答のJSON解析に失敗しました: " + e.getMessage());
+            logger.warning("JSON解析失敗: " + e.getMessage());
             return null;
         }
     }
