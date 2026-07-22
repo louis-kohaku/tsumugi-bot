@@ -26,11 +26,16 @@ public final class AppConfig {
     private static final DateTimeFormatter TIMESTAMP_FORMAT =
             DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
 
+    // ユーザーごとDB（記憶層）を配置するベースディレクトリのデフォルト値。
+    // この配下に「表示名+登録日時」フォルダを1ユーザー1つ作る想定。
+    private static final String DEFAULT_USER_DB_DIR = "data/users";
+
     public final String discordToken;
     public final String lmStudioBaseUrl;
     public final String lmStudioChatModel;
     public final String lmStudioEmbeddingModel;
     public final String dbPath;
+    public final String userDbDir;
     public final String sqliteVecExtensionPath;
 
     private AppConfig(Dotenv env) {
@@ -39,6 +44,7 @@ public final class AppConfig {
         this.lmStudioChatModel = env.get("LM_STUDIO_CHAT_MODEL", "");
         this.lmStudioEmbeddingModel = env.get("LM_STUDIO_EMBEDDING_MODEL", "");
         this.dbPath = resolveDbPath(env);
+        this.userDbDir = env.get("TSUMUGI_USER_DB_DIR", DEFAULT_USER_DB_DIR);
         this.sqliteVecExtensionPath = env.get("SQLITE_VEC_EXTENSION_PATH", "");
     }
 
