@@ -4,8 +4,10 @@ import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.entities.Guild;
 import net.dv8tion.jda.api.entities.Member;
 import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
-import tsumugi.diary.model.DiaryRecord;
+import tsumugi.diary.model.DiaryQueueEntry;
+import tsumugi.diary.store.DiaryQueueRepository;
 import tsumugi.diary.store.DiaryRepository;
+import tsumugi.diary.store.sqlite.SqliteDiaryQueueRepository;
 import tsumugi.diary.store.sqlite.SqliteDiaryRepository;
 import tsumugi.initialsetup.InitialSetupState;
 import tsumugi.initialsetup.model.InitialSetupRecord;
@@ -18,15 +20,14 @@ import java.util.logging.Logger;
 /**
  * 日記機能全体の組み立て・エントリーポイントを担うファサード。
  *
- * 要望部屋の作成は2経路ある:
- *  1. 新規ユーザーの名前確定時: InitialSetupServiceのonDisplayNameConfirmedコールバック経由
- *     （TsumugiApplication側で
- *       initialSetupManager.getService().setOnDisplayNameConfirmed(diaryManager::onMemberDisplayNameConfirmed)
- *       と配線する。詳細はCHANGES_TO_EXISTING_FILES.md参照）
- *  2. 既存ユーザー分のバックフィル: bootstrapGuilds()で起動時に
- *     initial_setup テーブル（COMPLETED状態＝表示名登録済み）を走査し、未作成なら作成する
+ * 【変更点】日記部屋へのアクセス集中対策として、セッション完了（最後の質問への回答）を
+ * 受けた時点では要約生成をその場で行わず、diary_queue（SQL永続キュー）へ積むだけにした。
+ * インメモリのDiarySessionはここで即座に破棄し、待機中のデータはSQLにのみ保持する。
+ * 実際の生成処理はDiaryQueueWorkerがバックグラウンドで順番に行う。
  *
- * InitialSetupRepositoryは読み取り専用の参照として利用するのみで、書き込みは行わない。
+ * 要望部屋の作成は2経路ある（変更なし）:
+ *  1. 新規ユーザーの名前確定時: InitialSetupServiceのonDisplayNameConfirmedコールバック経由
+ *  2. 既存ユーザー分のバックフィル: bootstrapGuilds()で起動時にinitial_setupテーブルを走査
  */
 public final class DiaryManager {
 
@@ -34,33 +35,46 @@ public final class DiaryManager {
 
     private final DiarySessionManager sessionManager;
     private final DiaryChannelService channelService;
-    private final DiaryService service;
+    private final DiaryQueueRepository queueRepository;
+    private final DiaryQueueWorker queueWorker;
     private final InitialSetupRepository initialSetupRepository;
 
     public DiaryManager(DiarySessionManager sessionManager,
                          DiaryChannelService channelService,
-                         DiaryService service,
+                         DiaryQueueRepository queueRepository,
+                         DiaryQueueWorker queueWorker,
                          InitialSetupRepository initialSetupRepository) {
         this.sessionManager = sessionManager;
         this.channelService = channelService;
-        this.service = service;
+        this.queueRepository = queueRepository;
+        this.queueWorker = queueWorker;
         this.initialSetupRepository = initialSetupRepository;
     }
 
+    /**
+     * @param diaryLlmClient 日記の総評生成に使うLlmClient。
+     *                       呼び出し側（TsumugiApplication）で LlmLane.DIARY に紐づいた
+     *                       LaneLlmClient を渡すこと。これにより「一度生成が始まったら
+     *                       会話が来ても完了まで中断しない」という挙動がLaneLlmDispatcher側で保証される。
+     */
     public static DiaryManager createDefault(SqliteConnectionFactory connectionFactory,
-                                               LlmClient llmClient,
+                                               LlmClient diaryLlmClient,
                                                InitialSetupRepository initialSetupRepository) {
         DiaryRepository repository = new SqliteDiaryRepository(connectionFactory);
-        DiarySummaryGenerator summaryGenerator = new DiarySummaryGenerator(llmClient);
+        DiaryQueueRepository queueRepository = new SqliteDiaryQueueRepository(connectionFactory);
+        DiarySummaryGenerator summaryGenerator = new DiarySummaryGenerator(diaryLlmClient);
         DiaryService service = new DiaryService(repository, summaryGenerator);
-        return new DiaryManager(new DiarySessionManager(), new DiaryChannelService(), service, initialSetupRepository);
+        DiaryChannelService channelService = new DiaryChannelService();
+        DiaryQueueWorker queueWorker = new DiaryQueueWorker(queueRepository, service, channelService);
+
+        return new DiaryManager(new DiarySessionManager(), channelService, queueRepository, queueWorker, initialSetupRepository);
     }
 
     /**
-     * Bot起動完了直後に呼ぶ。
-     * 1. 参加している全ギルドに「🌼｜要望」カテゴリが存在することを保証する。
-     * 2. 既に名前登録済み（InitialSetupState.COMPLETED）の全ユーザーについて、
-     *    要望部屋が無ければ作成する（Bot導入前から使っていた既存ユーザーのバックフィル）。
+     * Bot起動完了直後に呼ぶ。以下をまとめて保証する。
+     *  1. 参加している全ギルドに「🌼｜要望」カテゴリが存在すること
+     *  2. 既存ユーザー分の要望部屋バックフィル
+     *  3. diary_queueワーカーの起動（再起動をまたいだPROCESSING行の復旧を含む）
      */
     public void bootstrapGuilds(JDA jda) {
         for (Guild guild : jda.getGuilds()) {
@@ -87,12 +101,11 @@ public final class DiaryManager {
             }
         }
         logger.info("日記機能: 既存ユーザーの要望部屋バックフィルが完了しました。");
+
+        queueWorker.setJda(jda);
+        queueWorker.start();
     }
 
-    /**
-     * InitialSetupService.onDisplayNameConfirmedから呼ばれる想定のコールバック。
-     * 新規入室・引継ぎ確認完了の両方で、名前確定のたびに呼ばれる（冪等なので何度呼んでも安全）。
-     */
     public void onMemberDisplayNameConfirmed(Member member) {
         try {
             channelService.ensureRequestRoom(member.getGuild(), member, member.getEffectiveName());
@@ -116,7 +129,14 @@ public final class DiaryManager {
         channelService.postMessage(diaryRoom, sessionManager.currentPrompt(session));
     }
 
-    /** プライベート日記部屋への投稿を受け取ったときにDiaryListenerから呼ばれる。 */
+    /**
+     * プライベート日記部屋への投稿を受け取ったときにDiaryListenerから呼ばれる。
+     *
+     * 最後の質問（明日挑戦すること）への回答を受けてGENERATING_SUMMARY状態になった時点で、
+     * 要約生成はその場では行わず、DiaryQueueEntryを組み立ててdiary_queue（SQL）へ積むだけにする。
+     * インメモリのセッションはここで破棄する（待機データをメモリに残さないため）。
+     * 実際の生成はDiaryQueueWorkerが順番にLlmLane.DIARY経由で処理し、完了後にこのチャンネルへ投稿する。
+     */
     public void handleDiaryRoomMessage(Member member, String rawText, TextChannel channel) {
         long userId = member.getIdLong();
         DiarySession session = sessionManager.getSession(userId);
@@ -126,10 +146,9 @@ public final class DiaryManager {
             String nextPrompt = sessionManager.handleInput(session, rawText);
 
             if (session.state == DiaryState.GENERATING_SUMMARY) {
-                DiaryRecord record = service.completeSession(session);
-                channelService.postMessage(channel, record.dailySummary);
-                channelService.postMessage(channel, "この日記部屋は1分後に削除されます😊");
-                channelService.scheduleDiaryRoomDelete(channel);
+                DiaryQueueEntry entry = DiaryQueueEntry.fromSession(session, member.getGuild().getIdLong());
+                queueRepository.enqueue(entry);
+                channelService.postMessage(channel, DiaryWaitingMessages.random());
                 sessionManager.endSession(userId);
                 return;
             }
@@ -158,5 +177,6 @@ public final class DiaryManager {
 
     public void shutdown() {
         channelService.shutdown();
+        queueWorker.shutdown();
     }
 }
