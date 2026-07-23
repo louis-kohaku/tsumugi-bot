@@ -32,7 +32,17 @@ public final class AppConfig {
 
     public final String discordToken;
     public final String lmStudioBaseUrl;
+
+    /** 通常会話用のモデル。応答速度を優先するため、軽量なモデルを想定。 */
     public final String lmStudioChatModel;
+
+    /**
+     * Evidence抽出（感情・性格分析）・日記の総評生成など、精度を優先したい
+     * 重い処理専用のモデル。未設定の場合はlmStudioChatModelにフォールバックする
+     * （AppConfig.load()時点で判定できないため、フォールバック処理はTsumugiApplication側で行う）。
+     */
+    public final String lmStudioHeavyModel;
+
     public final String lmStudioEmbeddingModel;
     public final String dbPath;
     public final String userDbDir;
@@ -42,6 +52,7 @@ public final class AppConfig {
         this.discordToken = env.get("DISCORD_TOKEN", "");
         this.lmStudioBaseUrl = env.get("LM_STUDIO_BASE_URL", "http://localhost:1234");
         this.lmStudioChatModel = env.get("LM_STUDIO_CHAT_MODEL", "");
+        this.lmStudioHeavyModel = env.get("LM_STUDIO_HEAVY_MODEL", "");
         this.lmStudioEmbeddingModel = env.get("LM_STUDIO_EMBEDDING_MODEL", "");
         this.dbPath = resolveDbPath(env);
         this.userDbDir = env.get("TSUMUGI_USER_DB_DIR", DEFAULT_USER_DB_DIR);

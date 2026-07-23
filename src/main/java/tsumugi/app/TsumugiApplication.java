@@ -9,6 +9,12 @@ import tsumugi.core.model.TsumugiModel.Polarity;
 import tsumugi.discord.DiscordAdapter;
 import tsumugi.initialsetup.InitialSetupListener;
 import tsumugi.initialsetup.InitialSetupManager;
+import tsumugi.llm.EmbeddingClient;
+import tsumugi.llm.LaneEmbeddingClient;
+import tsumugi.llm.LaneLlmClient;
+import tsumugi.llm.LaneLlmDispatcher;
+import tsumugi.llm.LlmClient;
+import tsumugi.llm.LlmLane;
 import tsumugi.llm.LmStudioGateway;
 import tsumugi.memory.consolidate.MemoryConsolidator;
 import tsumugi.memory.extract.EvidenceExtractor;
@@ -30,29 +36,34 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.logging.Logger;
 
 /**
  * 紬希の起動エントリーポイント。
  *
- * DB構成は2種類に分かれている:
+ * 【変更点: LM Studioへの問い合わせを1本のディスパッチャに集約】
+ * 以前は会話応答・Evidence抽出・日記の総評生成がそれぞれ別スレッドから
+ * LM Studioへ直接（並列に）問い合わせていたが、これをやめて
+ * すべてLaneLlmDispatcher（ワーカースレッド1本）経由にした。
+ *
+ * レーンの構成:
+ *  - CHAT : 通常会話の応答生成・記憶検索。軽量モデル（config.lmStudioChatModel）を使用。
+ *  - DIARY: 日記の総評生成。CHATと同格の即時レーンで、重量モデル（config.lmStudioHeavyModel）を使用。
+ *           一度生成が始まったら、会話が来ても完了まで中断しない。
+ *  - HEAVY: Evidence抽出（性格・感情分析）。重量モデルを共用。CHAT/DIARYが無く、
+ *           一定時間アイドルが続いた場合にのみ着手する。
+ *
+ * ルールは「実行中のタスクは中断しない」の1点のみで、優先度は
+ * ワーカーが空いた瞬間に次に何を選ぶかだけに作用する（詳細はLaneLlmDispatcher参照）。
+ *
+ * DB構成（変更なし）:
  *  - 共有DB（config.dbPath）: initial_setup / withdrawal / membership_events /
- *    user_db_folders など、Discordサーバー運用に関わるデータ。
- *    管理者が横断的に扱う・状態検索が必要なため共有のまま。
+ *    user_db_folders / diary_records / diary_queue など。
  *  - ユーザーごとDB（config.userDbDir/{表示名+登録日時}/tsumugi.db）: episodic_events /
- *    evidence / evidence_vec / user_model など、本人の記憶そのもの。
- *    userId→フォルダ名の対応はUserDbFolderRepository（共有DB）が持ち、
- *    UserConnectionFactoryRegistryがそれを使って実際のファイルを解決する。
- *
- * 利用規約第10〜13条・AI利用者権利章典に対応するDataSubjectRightsServiceも
- * ここで組み立て、DiscordAdapterへ渡す。
- *
- * WithdrawalRepositoryはInitialSetupManager（内部のMembershipManagerが再入室時の
- * 引継ぎ判定に使う）とWithdrawalManagerの両方から参照される共有インスタンスのため、
- * ここで先に生成してから両者に渡す。UserConnectionFactoryRegistryも同様に、
- * 記憶層Repository群とInitialSetupManager（名前登録時のフォルダ割り当て）の
- * 両方から参照される共有インスタンスとして先に生成する。
+ *    evidence / evidence_vec / user_model など。
  */
 public final class TsumugiApplication {
 
@@ -69,12 +80,10 @@ public final class TsumugiApplication {
         }
         SqliteConnectionFactory sharedConnectionFactory =
                 new SqliteConnectionFactory(sharedDbPath, config.sqliteVecExtensionPath);
-        // 起動時に一度接続を張ってマイグレーションを走らせる
         sharedConnectionFactory.open().close();
         logger.info("共有DB接続OK: " + sharedDbPath);
 
         // ── ユーザーごとDB（記憶層）のセットアップ ────────────
-        // フォルダ名は「表示名+登録日時」。userId→フォルダ名の対応は共有DB上のuser_db_foldersが持つ。
         Path userDbDir = Paths.get(config.userDbDir);
         Files.createDirectories(userDbDir);
         UserDbFolderRepository userDbFolderRepository = new UserDbFolderRepository(sharedConnectionFactory);
@@ -86,7 +95,6 @@ public final class TsumugiApplication {
         SqliteUserModelRepository userModelRepository = new SqliteUserModelRepository(userDbRegistry);
         SqliteEpisodicEventRepository episodicEventRepository = new SqliteEpisodicEventRepository(userDbRegistry);
 
-        // 利用規約第10条(閲覧権)・第12条(削除権)・第13条(エクスポート権)対応
         DataSubjectRightsService dataSubjectRightsService = new DataSubjectRightsService(
                 episodicEventRepository, evidenceRepository, userModelRepository);
 
@@ -94,28 +102,54 @@ public final class TsumugiApplication {
         WithdrawalRepository withdrawalRepository = new SqliteWithdrawalRepository(sharedConnectionFactory);
 
         InitialSetupManager initialSetupManager =
-        InitialSetupManager.createDefault(sharedConnectionFactory, withdrawalRepository, userDbRegistry);
+                InitialSetupManager.createDefault(sharedConnectionFactory, withdrawalRepository, userDbRegistry);
         InitialSetupListener initialSetupListener = new InitialSetupListener(initialSetupManager);
 
-        // ── 退会フローのセットアップ（初期設定と同じ管理者ログチャンネルを使い回す） ──
-        WithdrawalManager withdrawalManager = WithdrawalManager.createDefault(
-                withdrawalRepository, dataSubjectRightsService, initialSetupManager.getChannelService());
-        WithdrawalListener withdrawalListener = new WithdrawalListener(withdrawalManager);
-        
         // ── LLM連携層のセットアップ ────────────────────
         OkHttpClient httpClient = new OkHttpClient.Builder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .readTimeout(Duration.ofSeconds(60))
                 .build();
 
-        LmStudioGateway llmGateway = new LmStudioGateway(
-                config.lmStudioBaseUrl,
-                config.lmStudioChatModel,
-                config.lmStudioEmbeddingModel,
-                httpClient);
+        // 重量モデルが未設定の場合は、通常会話用モデルにフォールバックする
+        // （設定ミスで即座に起動失敗にはせず、レーン分離自体は機能させる）。
+        String heavyModel = config.lmStudioHeavyModel.isBlank() ? config.lmStudioChatModel : config.lmStudioHeavyModel;
+        if (config.lmStudioHeavyModel.isBlank()) {
+            logger.warning("LM_STUDIO_HEAVY_MODELが未設定のため、日記・Evidence抽出も会話用モデルを使用します。");
+        }
 
-        MemoryConsolidator consolidator = new MemoryConsolidator(userModelRepository, evidenceRepository, llmGateway);
-        MemoryRetriever retriever = new MemoryRetriever(evidenceRepository, llmGateway);
+        LmStudioGateway chatGateway = new LmStudioGateway(
+                config.lmStudioBaseUrl, config.lmStudioChatModel, config.lmStudioEmbeddingModel, httpClient);
+        LmStudioGateway heavyGateway = new LmStudioGateway(
+                config.lmStudioBaseUrl, heavyModel, config.lmStudioEmbeddingModel, httpClient);
+
+        // CHAT=軽量・即時最優先 / DIARY=重量・CHATと同格の即時 / HEAVY=重量・アイドル時のみ
+        Map<LlmLane, LlmClient> llmClientsByLane = new EnumMap<>(LlmLane.class);
+        llmClientsByLane.put(LlmLane.CHAT, chatGateway);
+        llmClientsByLane.put(LlmLane.DIARY, heavyGateway);
+        llmClientsByLane.put(LlmLane.HEAVY, heavyGateway);
+
+        Map<LlmLane, EmbeddingClient> embeddingClientsByLane = new EnumMap<>(LlmLane.class);
+        embeddingClientsByLane.put(LlmLane.CHAT, chatGateway);
+        embeddingClientsByLane.put(LlmLane.DIARY, heavyGateway);
+        embeddingClientsByLane.put(LlmLane.HEAVY, heavyGateway);
+
+        LaneLlmDispatcher dispatcher = new LaneLlmDispatcher(llmClientsByLane, embeddingClientsByLane);
+
+        LlmClient chatLlm = new LaneLlmClient(dispatcher, LlmLane.CHAT);
+        EmbeddingClient chatEmbed = new LaneEmbeddingClient(dispatcher, LlmLane.CHAT);
+        LlmClient diaryLlm = new LaneLlmClient(dispatcher, LlmLane.DIARY);
+        LlmClient heavyLlm = new LaneLlmClient(dispatcher, LlmLane.HEAVY);
+        EmbeddingClient heavyEmbed = new LaneEmbeddingClient(dispatcher, LlmLane.HEAVY);
+
+        // ── 退会フローのセットアップ（初期設定と同じ管理者ログチャンネルを使い回す） ──
+        WithdrawalManager withdrawalManager = WithdrawalManager.createDefault(
+                withdrawalRepository, dataSubjectRightsService, initialSetupManager.getChannelService());
+        WithdrawalListener withdrawalListener = new WithdrawalListener(withdrawalManager);
+
+        // ── 記憶層: 会話中の検索はCHATレーン、Evidence保存時のembeddingはHEAVYレーン ──
+        MemoryConsolidator consolidator = new MemoryConsolidator(userModelRepository, evidenceRepository, heavyEmbed);
+        MemoryRetriever retriever = new MemoryRetriever(evidenceRepository, chatEmbed);
 
         if (config.lmStudioChatModel.isBlank()) {
             logger.warning(".envにLM_STUDIO_CHAT_MODELが未設定のため、LLM疎通テストをスキップします。");
@@ -123,23 +157,19 @@ public final class TsumugiApplication {
             runSmokeTest(consolidator, retriever);
         }
 
-        // ── ADDED: 日記機能のセットアップ ──────────────────
-        // InitialSetupRepositoryを読み取り専用の参照として利用する（起動時バックフィル用）
+        // ── 日記機能のセットアップ（要約生成はDIARYレーン） ──────────
         tsumugi.initialsetup.store.InitialSetupRepository initialSetupRepositoryForDiary =
                 new tsumugi.initialsetup.store.sqlite.SqliteInitialSetupRepository(sharedConnectionFactory);
         tsumugi.diary.DiaryManager diaryManager = tsumugi.diary.DiaryManager.createDefault(
-                sharedConnectionFactory, llmGateway, initialSetupRepositoryForDiary);
+                sharedConnectionFactory, diaryLlm, initialSetupRepositoryForDiary);
         tsumugi.diary.DiaryListener diaryListener = new tsumugi.diary.DiaryListener(diaryManager);
 
-        // 名前確定時のフック配線（新規入室・引継ぎ確認完了の両方をカバー）
         initialSetupManager.getService().setOnDisplayNameConfirmed(diaryManager::onMemberDisplayNameConfirmed);
 
-        
-
-        // ── 会話エンジン・Evidence抽出層のセットアップ ──────
+        // ── 会話エンジン（CHATレーン）・Evidence抽出層（HEAVYレーン）のセットアップ ──
         ConversationEngine conversationEngine = new ConversationEngine(
-                llmGateway, retriever, episodicEventRepository, userModelRepository);
-        EvidenceExtractor evidenceExtractor = new EvidenceExtractor(llmGateway, consolidator);
+                chatLlm, retriever, episodicEventRepository, userModelRepository);
+        EvidenceExtractor evidenceExtractor = new EvidenceExtractor(heavyLlm, consolidator);
 
         // ── Discordアダプタの起動 ─────────────────────
         if (config.discordToken.isBlank()) {
@@ -147,6 +177,8 @@ public final class TsumugiApplication {
             logger.info("紬希のセットアップが完了しました。（Discord未接続）");
             initialSetupManager.shutdown();
             withdrawalManager.shutdown();
+            diaryManager.shutdown();
+            dispatcher.shutdown();
             httpClient.dispatcher().executorService().shutdown();
             httpClient.connectionPool().evictAll();
             return;
@@ -155,22 +187,22 @@ public final class TsumugiApplication {
         DiscordAdapter adapter = new DiscordAdapter(
                 conversationEngine, episodicEventRepository, evidenceExtractor, dataSubjectRightsService);
         JDA jda = DiscordAdapter.start(config.discordToken, adapter,
-                initialSetupListener, withdrawalListener, diaryListener); // ADDED: diaryListener
+                initialSetupListener, withdrawalListener, diaryListener);
         initialSetupManager.bootstrapGuilds(jda);
         withdrawalManager.ensureWithdrawalRequestChannelsForAllGuilds(jda);
-        diaryManager.bootstrapGuilds(jda); // ADDED: 既存ユーザー分の要望部屋バックフィル
+        diaryManager.bootstrapGuilds(jda); // ここでdiary_queueワーカーも起動する
 
-// ADDED: /日記 スラッシュコマンドをDiscordに登録
-jda.updateCommands().addCommands(tsumugi.diary.DiaryListener.commandData()).queue();
+        jda.updateCommands().addCommands(tsumugi.diary.DiaryListener.commandData()).queue();
 
-logger.info("紬希のDiscord接続が完了しました。");
+        logger.info("紬希のDiscord接続が完了しました。");
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             logger.info("紬希をシャットダウンします...");
             adapter.shutdown();
             initialSetupManager.shutdown();
             withdrawalManager.shutdown();
-            diaryManager.shutdown(); // ADDED
+            diaryManager.shutdown();
+            dispatcher.shutdown();
             jda.shutdown();
             httpClient.dispatcher().executorService().shutdown();
             httpClient.connectionPool().evictAll();
@@ -178,7 +210,7 @@ logger.info("紬希のDiscord接続が完了しました。");
     }
 
     private static void runSmokeTest(MemoryConsolidator consolidator, MemoryRetriever retriever) {
-        long testUserId = 0L; // スモークテスト専用の仮ユーザーID（data/users/unregistered_0_.../tsumugi.db が作られる）
+        long testUserId = 0L; // スモークテスト専用の仮ユーザーID
 
         Evidence evidence = new Evidence();
         evidence.category = EvidenceCategory.HABIT;
