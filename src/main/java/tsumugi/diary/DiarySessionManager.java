@@ -1,7 +1,6 @@
 package tsumugi.diary;
 
 import java.time.LocalTime;
-import java.time.format.DateTimeParseException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
@@ -129,7 +128,7 @@ public final class DiarySessionManager {
         if (colon.find()) {
             try {
                 return LocalTime.of(Integer.parseInt(colon.group(1)), Integer.parseInt(colon.group(2)));
-            } catch (DateTimeParseException | NumberFormatException | java.time.DateTimeException ignored) {
+            } catch (NumberFormatException | java.time.DateTimeException ignored) {
                 // フォールスルーして次のパターンを試す
             }
         }
