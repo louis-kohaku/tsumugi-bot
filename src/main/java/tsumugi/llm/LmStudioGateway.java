@@ -27,7 +27,7 @@ import java.util.logging.Logger;
  * ・上記により、会話用モデルとembedding用モデルが個別のTTLタイマーで
  *   同時に常駐できる
  */
-public final class LmStudioGateway implements LlmClient, EmbeddingClient {
+public final class LmStudioGateway implements LlmClient, EmbeddingClient, tsumugi.llm.EmbeddingClient {
 
     private static final Logger logger = Logger.getLogger(LmStudioGateway.class.getName());
 
