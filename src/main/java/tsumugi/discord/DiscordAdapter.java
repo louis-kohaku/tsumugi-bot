@@ -1,4 +1,3 @@
-
 package tsumugi.discord;
 
 import net.dv8tion.jda.api.JDA;
@@ -18,6 +17,7 @@ import tsumugi.memory.store.EpisodicEventRepository;
 import java.time.LocalDate;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
@@ -28,6 +28,17 @@ import java.util.logging.Logger;
  * 利用規約第12条（削除権）・AI利用者権利章典第4条（忘れられる権利）に対応するため、
  * 「忘れて」を含む発話をトリガーとしてDataSubjectRightsService.forgetUser()を呼び出す。
  * ※簡易な文字列一致によるトリガーであり、誤爆防止のため確認メッセージを挟む2段階方式とする。
+ *
+ * 【変更点】Evidence抽出（性格・感情等の分析）は、以前は応答生成の直後に同期で実行していたが、
+ * これをやめて「応答送信後、30秒後にEvidence抽出用の投入専用スレッドへ回す」方式に変更した。
+ * 理由:
+ *  - Evidence抽出はLlmLane.HEAVYで実行され、LaneLlmDispatcher側で「会話が一定時間アイドルに
+ *    なるまで着手しない」よう制御されている。会話直後にworkerPoolのスレッドで同期的に
+ *    呼び出すと、そのスレッドがHEAVYレーンの順番待ちで長時間ブロックされ、
+ *    workerPool（4並列）の枯渇につながりうる。
+ *  - 30秒の遅延自体が「実行開始のタイミングを後ろにずらす」ための間引きにもなる。
+ * 投入は専用の単一スレッド（evidenceScheduler）で行うため、ここが仮にHEAVYレーンの
+ * 順番待ちでブロックされても、会話応答用のworkerPoolには一切影響しない。
  */
 public final class DiscordAdapter extends ListenerAdapter {
 
@@ -42,11 +53,22 @@ public final class DiscordAdapter extends ListenerAdapter {
     private static final String FORGET_DONE_REPLY =
             "これまでの記憶を削除しました。次にお話しするときは、また一からよろしくお願いします。";
 
+    /** Evidence抽出を応答送信からどれだけ遅らせて投入するか。 */
+    private static final long EVIDENCE_EXTRACT_DELAY_SECONDS = 30;
+
     private final ConversationEngine conversationEngine;
     private final EpisodicEventRepository episodicEventRepository;
     private final EvidenceExtractor evidenceExtractor;
     private final DataSubjectRightsService dataSubjectRightsService;
     private final ExecutorService workerPool = Executors.newFixedThreadPool(4);
+
+    /** Evidence抽出の「投入」だけを行う専用スレッド。ここがHEAVYレーンの順番待ちでブロックされても会話には影響しない。 */
+    private final ScheduledExecutorService evidenceScheduler =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "evidence-extract-scheduler");
+                t.setDaemon(true);
+                return t;
+            });
 
     public DiscordAdapter(ConversationEngine conversationEngine,
                            EpisodicEventRepository episodicEventRepository,
@@ -64,7 +86,7 @@ public final class DiscordAdapter extends ListenerAdapter {
     }
 
     /**
-     * JDAを起動し、このアダプタに加えて追加のリスナー（例: 初期設定用のInitialSetupListener）も登録する。
+     * JDAを起動し、このアダプタに加えて追加のリスナー（例: InitialSetupListener, WithdrawalListener）も登録する。
      * GUILD_MEMBERSインテントは初期設定フロー（GuildMemberJoinEvent検知）に必要なため、ここで有効化する。
      */
     public static JDA start(String token, DiscordAdapter adapter, Object... additionalListeners) throws InterruptedException {
@@ -83,22 +105,14 @@ public final class DiscordAdapter extends ListenerAdapter {
         return jda;
     }
 
-    // 入室チャンネル（🌼｜入室）・管理者ログチャンネル（🌼｜管理者ログ）・
-    // 退会希望チャンネル（🌼｜退会希望）・本人専用退会チャンネル（🌼｜退会-*）は
-    // 初期設定/管理者/退会専用のため、通常会話としては扱わない。
-    private static final String ENTRY_CHANNEL_NAME = "🌼｜入室";
-    private static final String ADMIN_LOG_CHANNEL_NAME = "🌼｜管理者ログ";
-    private static final String WITHDRAWAL_REQUEST_CHANNEL_NAME = "🌼｜退会希望";
-    private static final String WITHDRAWAL_CHANNEL_PREFIX = "🌼｜退会-";
+    // 「🌼｜」で始まるチャンネル（入室・退会・管理者通知・要望・日記など、紬希が作るシステム専用チャンネル）は
+    // 通常会話としては扱わない。実際の処理は各機能のListener側が担当する。
+    private static final String SYSTEM_CHANNEL_PREFIX = "🌼｜";
 
     @Override
     public void onMessageReceived(MessageReceivedEvent event) {
         if (event.getAuthor().isBot()) return;
-        String channelName = event.getChannel().getName();
-        if (ENTRY_CHANNEL_NAME.equals(channelName)
-                || ADMIN_LOG_CHANNEL_NAME.equals(channelName)
-                || WITHDRAWAL_REQUEST_CHANNEL_NAME.equals(channelName)
-                || channelName.startsWith(WITHDRAWAL_CHANNEL_PREFIX)) return;
+        if (event.getChannel().getName().startsWith(SYSTEM_CHANNEL_PREFIX)) return;
 
         String text = event.getMessage().getContentDisplay();
         if (text == null || text.isBlank()) return;
@@ -127,6 +141,10 @@ public final class DiscordAdapter extends ListenerAdapter {
                     userId, ChannelType.NORMAL_CHAT, text, Speaker.USER, LocalDate.now(), null);
             episodicEventRepository.save(userEvent);
 
+            // ここでLlmLane.CHATを通じてLM Studioへ問い合わせる。
+            // このスレッドはこの呼び出しが完了するまでブロックされるが、
+            // LaneLlmDispatcher側では常にCHATが最優先で選ばれるため、
+            // 日記(DIARY)が実行中でなければ即座に処理される。
             String reply = conversationEngine.generateReply(userId, text);
             if (reply == null || reply.isBlank()) {
                 reply = FALLBACK_REPLY;
@@ -137,12 +155,19 @@ public final class DiscordAdapter extends ListenerAdapter {
                     userId, ChannelType.NORMAL_CHAT, reply, Speaker.AI, LocalDate.now(), null);
             episodicEventRepository.save(aiEvent);
 
-            // Evidence抽出・UserModelへの反映は応答速度に影響させたくないので非同期のまま続行する
-            try {
-                evidenceExtractor.extractAndConsolidate(userId, userEvent.id, text);
-            } catch (RuntimeException e) {
-                logger.warning("Evidence抽出処理で例外が発生しました (userId=" + userId + "): " + e.getMessage());
-            }
+            // Evidence抽出（HEAVYレーン）はここでは実行しない。
+            // 30秒後に専用スケジューラへ投入するだけにして、会話応答用のworkerPoolスレッドを
+            // すぐに解放する（HEAVYレーンの順番待ちで会話処理が詰まるのを防ぐため）。
+            String userTextForExtraction = text;
+            String sourceEventId = userEvent.id;
+            evidenceScheduler.schedule(() -> {
+                try {
+                    evidenceExtractor.extractAndConsolidate(userId, sourceEventId, userTextForExtraction);
+                } catch (RuntimeException e) {
+                    logger.warning("Evidence抽出処理で例外が発生しました (userId=" + userId + "): " + e.getMessage());
+                }
+            }, EVIDENCE_EXTRACT_DELAY_SECONDS, TimeUnit.SECONDS);
+
         } catch (RuntimeException e) {
             logger.warning("メッセージ処理中にエラーが発生しました (userId=" + userId + "): " + e.getMessage());
             channel.sendMessage("エラーが発生しました。少し時間をおいて、もう一度お試しください。").queue();
@@ -151,12 +176,17 @@ public final class DiscordAdapter extends ListenerAdapter {
 
     public void shutdown() {
         workerPool.shutdown();
+        evidenceScheduler.shutdown();
         try {
             if (!workerPool.awaitTermination(10, TimeUnit.SECONDS)) {
                 workerPool.shutdownNow();
             }
+            if (!evidenceScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                evidenceScheduler.shutdownNow();
+            }
         } catch (InterruptedException e) {
             workerPool.shutdownNow();
+            evidenceScheduler.shutdownNow();
             Thread.currentThread().interrupt();
         }
     }
