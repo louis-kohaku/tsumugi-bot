@@ -93,16 +93,15 @@ public final class TsumugiApplication {
         // ── 退会機能のRepositoryを先に生成（初期設定側のMembershipManagerと共有するため） ──
         WithdrawalRepository withdrawalRepository = new SqliteWithdrawalRepository(sharedConnectionFactory);
 
-        // ── 初期設定フロー（入退室記録・引継ぎ確認・ユーザー用DBフォルダの命名を含む）のセットアップ ──
         InitialSetupManager initialSetupManager =
-                InitialSetupManager.createDefault(sharedConnectionFactory, withdrawalRepository, userDbRegistry);
+        InitialSetupManager.createDefault(sharedConnectionFactory, withdrawalRepository, userDbRegistry);
         InitialSetupListener initialSetupListener = new InitialSetupListener(initialSetupManager);
 
         // ── 退会フローのセットアップ（初期設定と同じ管理者ログチャンネルを使い回す） ──
         WithdrawalManager withdrawalManager = WithdrawalManager.createDefault(
                 withdrawalRepository, dataSubjectRightsService, initialSetupManager.getChannelService());
         WithdrawalListener withdrawalListener = new WithdrawalListener(withdrawalManager);
-
+        
         // ── LLM連携層のセットアップ ────────────────────
         OkHttpClient httpClient = new OkHttpClient.Builder()
                 .connectTimeout(Duration.ofSeconds(10))
@@ -124,6 +123,19 @@ public final class TsumugiApplication {
             runSmokeTest(consolidator, retriever);
         }
 
+        // ── ADDED: 日記機能のセットアップ ──────────────────
+        // InitialSetupRepositoryを読み取り専用の参照として利用する（起動時バックフィル用）
+        tsumugi.initialsetup.store.InitialSetupRepository initialSetupRepositoryForDiary =
+                new tsumugi.initialsetup.store.sqlite.SqliteInitialSetupRepository(sharedConnectionFactory);
+        tsumugi.diary.DiaryManager diaryManager = tsumugi.diary.DiaryManager.createDefault(
+                sharedConnectionFactory, llmGateway, initialSetupRepositoryForDiary);
+        tsumugi.diary.DiaryListener diaryListener = new tsumugi.diary.DiaryListener(diaryManager);
+
+        // 名前確定時のフック配線（新規入室・引継ぎ確認完了の両方をカバー）
+        initialSetupManager.getService().setOnDisplayNameConfirmed(diaryManager::onMemberDisplayNameConfirmed);
+
+        
+
         // ── 会話エンジン・Evidence抽出層のセットアップ ──────
         ConversationEngine conversationEngine = new ConversationEngine(
                 llmGateway, retriever, episodicEventRepository, userModelRepository);
@@ -142,16 +154,23 @@ public final class TsumugiApplication {
 
         DiscordAdapter adapter = new DiscordAdapter(
                 conversationEngine, episodicEventRepository, evidenceExtractor, dataSubjectRightsService);
-        JDA jda = DiscordAdapter.start(config.discordToken, adapter, initialSetupListener, withdrawalListener);
+        JDA jda = DiscordAdapter.start(config.discordToken, adapter,
+                initialSetupListener, withdrawalListener, diaryListener); // ADDED: diaryListener
         initialSetupManager.bootstrapGuilds(jda);
         withdrawalManager.ensureWithdrawalRequestChannelsForAllGuilds(jda);
-        logger.info("紬希のDiscord接続が完了しました。");
+        diaryManager.bootstrapGuilds(jda); // ADDED: 既存ユーザー分の要望部屋バックフィル
+
+// ADDED: /日記 スラッシュコマンドをDiscordに登録
+jda.updateCommands().addCommands(tsumugi.diary.DiaryListener.commandData()).queue();
+
+logger.info("紬希のDiscord接続が完了しました。");
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             logger.info("紬希をシャットダウンします...");
             adapter.shutdown();
             initialSetupManager.shutdown();
             withdrawalManager.shutdown();
+            diaryManager.shutdown(); // ADDED
             jda.shutdown();
             httpClient.dispatcher().executorService().shutdown();
             httpClient.connectionPool().evictAll();
