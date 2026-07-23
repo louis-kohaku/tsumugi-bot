@@ -35,7 +35,17 @@ import java.util.logging.Logger;
  *       名前入力の後、庭チャンネル作成の前に挟む形で復活させる想定。
  */
 public final class InitialSetupService {
+    private volatile java.util.function.Consumer<Member> onDisplayNameConfirmed;
 
+    /**
+     * 表示名確定（名前入力 or 引継ぎ確認完了）のタイミングで呼ばれるコールバックを登録する。
+     * DiaryManager等、初期設定完了を起点に個人チャンネルを用意したい機能から利用する想定。
+     * InitialSetupServiceは呼び出し先の実体（Diary等）を一切知らずに済むよう、
+     * Consumer<Member>という薄いインタフェースのみに依存する。
+     */
+    public void setOnDisplayNameConfirmed(java.util.function.Consumer<Member> callback) {
+        this.onDisplayNameConfirmed = callback;
+    }
     private static final Logger logger = Logger.getLogger(InitialSetupService.class.getName());
 
     private static final String YES_KEYWORD = "はい";
@@ -116,7 +126,16 @@ public final class InitialSetupService {
 
         // TODO: ここで本来はWAITING_CONSENT等へ進めるが、現状は同意フロー未実装のためCOMPLETED扱いとする。
         transition(record, InitialSetupState.COMPLETED);
+
+        // 追加: 名前確定（新規入室・引継ぎ確認完了の両方）を機能横断で通知する
+        if (onDisplayNameConfirmed != null) {
+            try {
+                onDisplayNameConfirmed.accept(member);
+            } catch (RuntimeException e) {
+            logger.warning("表示名確定コールバックの実行に失敗しました (userId=" + member.getIdLong() + "): " + e.getMessage());
+        }
     }
+}
 
     // ═══════════════════════════════════════
     //  退室時のクリーンアップ
