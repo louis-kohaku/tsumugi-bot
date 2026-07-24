@@ -2,10 +2,11 @@ package tsumugi.llm;
 
 /**
  * LaneLlmDispatcherへ、固定のLlmLaneでembedを流し込む薄いアダプタ。
- * MemoryRetriever/MemoryConsolidator等、既存のEmbeddingClient利用側の
- * コードは一切変更せずに済むようにするためのもの。
+ * MemoryRetriever/MemoryConsolidator（tsumugi.memory.embedding.EmbeddingClient）と
+ * tsumugi.llm系の両方のEmbeddingClientインタフェースを実装し、
+ * どちらの利用側コードも変更せずに済むようにする。
  */
-public final class LaneEmbeddingClient implements EmbeddingClient {
+public final class LaneEmbeddingClient implements EmbeddingClient, tsumugi.memory.embedding.EmbeddingClient {
 
     private final LaneLlmDispatcher dispatcher;
     private final LlmLane lane;

@@ -137,10 +137,10 @@ public final class TsumugiApplication {
         LaneLlmDispatcher dispatcher = new LaneLlmDispatcher(llmClientsByLane, embeddingClientsByLane);
 
         LlmClient chatLlm = new LaneLlmClient(dispatcher, LlmLane.CHAT);
-        EmbeddingClient chatEmbed = new LaneEmbeddingClient(dispatcher, LlmLane.CHAT);
+        LaneEmbeddingClient chatEmbed = new LaneEmbeddingClient(dispatcher, LlmLane.CHAT);
         LlmClient diaryLlm = new LaneLlmClient(dispatcher, LlmLane.DIARY);
         LlmClient heavyLlm = new LaneLlmClient(dispatcher, LlmLane.HEAVY);
-        EmbeddingClient heavyEmbed = new LaneEmbeddingClient(dispatcher, LlmLane.HEAVY);
+        LaneEmbeddingClient heavyEmbed = new LaneEmbeddingClient(dispatcher, LlmLane.HEAVY);
 
         // ── 退会フローのセットアップ（初期設定と同じ管理者ログチャンネルを使い回す） ──
         WithdrawalManager withdrawalManager = WithdrawalManager.createDefault(
