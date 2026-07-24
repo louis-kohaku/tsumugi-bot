@@ -1,12 +1,13 @@
 package tsumugi.diary.store.sqlite;
 
-import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
 import tsumugi.diary.DiaryMode;
 import tsumugi.diary.DiaryQueueStatus;
 import tsumugi.diary.model.DiaryQueueEntry;
 import tsumugi.diary.store.DiaryQueueRepository;
 import tsumugi.memory.store.sqlite.SqliteConnectionFactory;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -20,9 +21,9 @@ import java.util.Optional;
 import java.util.logging.Logger;
 
 /**
- * diary_queueテーブルへのSQLite実装。
+ * DiaryQueueEntryをdiary_queueテーブルに保存する実装。
  * 既存スキーマ（記憶層・initial_setup・withdrawal・diary_records）とは独立したテーブルのため、
- * このクラス自身でマイグレーションまで面倒を見る（他のSqlite*Repositoryと同じ方針）。
+ * このクラス自身でマイグレーションまで面倒を見る（既存Repository実装群と同じ方針）。
  */
 public final class SqliteDiaryQueueRepository implements DiaryQueueRepository {
 
@@ -88,15 +89,15 @@ public final class SqliteDiaryQueueRepository implements DiaryQueueRepository {
                 ps.setString(8, entry.achievements);
                 ps.setString(9, entry.badPoints);
                 ps.setString(10, entry.tomorrowChallenge);
-                ps.setString(11, DiaryQueueStatus.PENDING.name());
+                ps.setString(11, entry.status != null ? entry.status.name() : DiaryQueueStatus.PENDING.name());
                 ps.setString(12, entry.enqueuedAt != null ? entry.enqueuedAt.toString() : Instant.now().toString());
-                ps.setString(13, null);
-                ps.setString(14, null);
-                ps.setString(15, null);
+                ps.setString(13, entry.startedAt != null ? entry.startedAt.toString() : null);
+                ps.setString(14, entry.completedAt != null ? entry.completedAt.toString() : null);
+                ps.setString(15, entry.errorMessage);
                 ps.executeUpdate();
             }
         } catch (SQLException e) {
-            logger.warning("diary_queueへの登録に失敗しました (userId=" + entry.userId + "): " + e.getMessage());
+            logger.warning("DiaryQueueEntryの追加に失敗しました (userId=" + entry.userId + "): " + e.getMessage());
         }
     }
 
@@ -104,7 +105,7 @@ public final class SqliteDiaryQueueRepository implements DiaryQueueRepository {
     public Optional<DiaryQueueEntry> loadNextPending() {
         String sql = """
             SELECT * FROM diary_queue
-            WHERE status=?
+            WHERE status = ?
             ORDER BY enqueued_at ASC
             LIMIT 1
             """;
@@ -113,32 +114,64 @@ public final class SqliteDiaryQueueRepository implements DiaryQueueRepository {
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, DiaryQueueStatus.PENDING.name());
                 try (ResultSet rs = ps.executeQuery()) {
-                    if (rs.next()) return Optional.of(map(rs));
+                    if (rs.next()) {
+                        return Optional.of(map(rs));
+                    }
                     return Optional.empty();
                 }
             }
         } catch (SQLException e) {
-            logger.warning("diary_queueの読み込みに失敗しました: " + e.getMessage());
+            logger.warning("DiaryQueueEntryの取得に失敗しました: " + e.getMessage());
             return Optional.empty();
         }
     }
 
     @Override
     public void markProcessing(String id) {
-        updateStatus(id, DiaryQueueStatus.PROCESSING, "started_at", Instant.now().toString());
+        String sql = """
+            UPDATE diary_queue
+            SET status = ?, started_at = ?
+            WHERE id = ?
+            """;
+        try (Connection conn = connectionFactory.open()) {
+            ensureSchema(conn);
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, DiaryQueueStatus.PROCESSING.name());
+                ps.setString(2, Instant.now().toString());
+                ps.setString(3, id);
+                ps.executeUpdate();
+            }
+        } catch (SQLException e) {
+            logger.warning("DiaryQueueEntryの処理中マークに失敗しました (id=" + id + "): " + e.getMessage());
+        }
     }
 
     @Override
     public void markDone(String id) {
-        updateStatus(id, DiaryQueueStatus.DONE, "completed_at", Instant.now().toString());
+        String sql = """
+            UPDATE diary_queue
+            SET status = ?, completed_at = ?
+            WHERE id = ?
+            """;
+        try (Connection conn = connectionFactory.open()) {
+            ensureSchema(conn);
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, DiaryQueueStatus.DONE.name());
+                ps.setString(2, Instant.now().toString());
+                ps.setString(3, id);
+                ps.executeUpdate();
+            }
+        } catch (SQLException e) {
+            logger.warning("DiaryQueueEntryの完了マークに失敗しました (id=" + id + "): " + e.getMessage());
+        }
     }
 
     @Override
     public void markFailed(String id, String errorMessage) {
         String sql = """
             UPDATE diary_queue
-            SET status=?, completed_at=?, error_message=?
-            WHERE id=?
+            SET status = ?, completed_at = ?, error_message = ?
+            WHERE id = ?
             """;
         try (Connection conn = connectionFactory.open()) {
             ensureSchema(conn);
@@ -150,13 +183,17 @@ public final class SqliteDiaryQueueRepository implements DiaryQueueRepository {
                 ps.executeUpdate();
             }
         } catch (SQLException e) {
-            logger.warning("diary_queueの失敗マークに失敗しました (id=" + id + "): " + e.getMessage());
+            logger.warning("DiaryQueueEntryの失敗マークに失敗しました (id=" + id + "): " + e.getMessage());
         }
     }
 
     @Override
     public void resetOrphanedProcessing() {
-        String sql = "UPDATE diary_queue SET status=?, started_at=NULL WHERE status=?";
+        String sql = """
+            UPDATE diary_queue
+            SET status = ?, started_at = NULL
+            WHERE status = ?
+            """;
         try (Connection conn = connectionFactory.open()) {
             ensureSchema(conn);
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -164,26 +201,11 @@ public final class SqliteDiaryQueueRepository implements DiaryQueueRepository {
                 ps.setString(2, DiaryQueueStatus.PROCESSING.name());
                 int updated = ps.executeUpdate();
                 if (updated > 0) {
-                    logger.info("再起動により中断していたdiary_queue行を復旧しました: 件数=" + updated);
+                    logger.info("再起動をまたいで処理中のままだったdiary_queueを" + updated + "件PENDINGに戻しました。");
                 }
             }
         } catch (SQLException e) {
-            logger.warning("diary_queueの孤立行復旧に失敗しました: " + e.getMessage());
-        }
-    }
-
-    private void updateStatus(String id, DiaryQueueStatus status, String timestampColumn, String timestampValue) {
-        String sql = "UPDATE diary_queue SET status=?, " + timestampColumn + "=? WHERE id=?";
-        try (Connection conn = connectionFactory.open()) {
-            ensureSchema(conn);
-            try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.setString(1, status.name());
-                ps.setString(2, timestampValue);
-                ps.setString(3, id);
-                ps.executeUpdate();
-            }
-        } catch (SQLException e) {
-            logger.warning("diary_queueの状態更新に失敗しました (id=" + id + "): " + e.getMessage());
+            logger.warning("diary_queueの処理中フラグのリセットに失敗しました: " + e.getMessage());
         }
     }
 
@@ -195,19 +217,24 @@ public final class SqliteDiaryQueueRepository implements DiaryQueueRepository {
         e.channelId = rs.getLong("channel_id");
         e.mode = DiaryMode.valueOf(rs.getString("mode"));
         e.wakeUpTime = rs.getString("wake_up_time");
+
         Map<String, String> timeline = GSON.fromJson(rs.getString("timeline_json"),
                 new TypeToken<LinkedHashMap<String, String>>() {}.getType());
         e.timeline = timeline != null ? timeline : new LinkedHashMap<>();
+
         e.achievements = rs.getString("achievements");
         e.badPoints = rs.getString("bad_points");
         e.tomorrowChallenge = rs.getString("tomorrow_challenge");
         e.status = DiaryQueueStatus.valueOf(rs.getString("status"));
-        e.enqueuedAt = Instant.parse(rs.getString("enqueued_at"));
-        String started = rs.getString("started_at");
-        e.startedAt = started != null ? Instant.parse(started) : null;
-        String completed = rs.getString("completed_at");
-        e.completedAt = completed != null ? Instant.parse(completed) : null;
+
+        String enqueuedAt = rs.getString("enqueued_at");
+        e.enqueuedAt = enqueuedAt != null ? Instant.parse(enqueuedAt) : null;
+        String startedAt = rs.getString("started_at");
+        e.startedAt = startedAt != null ? Instant.parse(startedAt) : null;
+        String completedAt = rs.getString("completed_at");
+        e.completedAt = completedAt != null ? Instant.parse(completedAt) : null;
         e.errorMessage = rs.getString("error_message");
+
         return e;
     }
 }
