@@ -32,7 +32,7 @@ public final class LmStudioGateway implements LlmClient, EmbeddingClient, tsumug
     private static final Logger logger = Logger.getLogger(LmStudioGateway.class.getName());
 
     /** アイドル状態が何秒続いたらLM Studio側がモデルをアンロードするか */
-    private static final int IDLE_TTL_SECONDS = 600; // 10分
+    private static final int IDLE_TTL_SECONDS = 120; // 10分
 
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 

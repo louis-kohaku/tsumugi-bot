@@ -51,9 +51,9 @@ public final class AppConfig {
     private AppConfig(Dotenv env) {
         this.discordToken = env.get("DISCORD_TOKEN", "");
         this.lmStudioBaseUrl = env.get("LM_STUDIO_BASE_URL", "http://localhost:1234");
-        this.lmStudioChatModel = env.get("LM_STUDIO_CHAT_MODEL", "");
-        this.lmStudioHeavyModel = env.get("LM_STUDIO_HEAVY_MODEL", "");
-        this.lmStudioEmbeddingModel = env.get("LM_STUDIO_EMBEDDING_MODEL", "");
+        this.lmStudioChatModel = env.get("LM_STUDIO_CHAT_MODEL", "google/gemma-4-e2b");
+        this.lmStudioHeavyModel = env.get("LM_STUDIO_HEAVY_MODEL", "google/gemma-4-e4b");
+        this.lmStudioEmbeddingModel = env.get("LM_STUDIO_EMBEDDING_MODEL", "text-embedding-nomic-embed-text-v2-moe");
         this.dbPath = resolveDbPath(env);
         this.userDbDir = env.get("TSUMUGI_USER_DB_DIR", DEFAULT_USER_DB_DIR);
         this.sqliteVecExtensionPath = env.get("SQLITE_VEC_EXTENSION_PATH", "");
