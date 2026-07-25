@@ -320,6 +320,19 @@ public final class InitialSetupChannelService {
         );
     }
 
+    /**
+     * 任意のチャンネルへ汎用メッセージを送る。
+     * 引継ぎ確認チャンネルで「はい/いいえ」以外の入力を受けた際の再入力案内など、
+     * 管理者ログ以外の一般的な案内メッセージ送信に使う。
+     */
+    public void postMessage(TextChannel channel, String message) {
+        if (channel == null) return;
+        channel.sendMessage(message).queue(
+                success -> {},
+                failure -> logger.warning("メッセージの送信に失敗しました (channelId=" + channel.getIdLong() + "): " + failure.getMessage())
+        );
+    }
+
     public void shutdown() {
         scheduler.shutdown();
         try {
