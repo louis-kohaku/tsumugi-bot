@@ -8,6 +8,9 @@ import tsumugi.initialsetup.store.sqlite.SqliteInitialSetupRepository;
 import tsumugi.membership.MembershipManager;
 import tsumugi.membership.store.MembershipRepository;
 import tsumugi.membership.store.sqlite.SqliteMembershipRepository;
+import tsumugi.memory.anonymized.AnonymizedDataRepository;
+import tsumugi.memory.rights.DataSubjectRightsService;
+import tsumugi.memory.store.EvidenceRepository;
 import tsumugi.memory.store.sqlite.SqliteConnectionFactory;
 import tsumugi.memory.store.sqlite.UserConnectionFactoryRegistry;
 import tsumugi.withdrawal.store.WithdrawalRepository;
@@ -22,6 +25,12 @@ import java.util.logging.Logger;
  *
  * DiscordAdapter同様、JDAのイベント自体はInitialSetupListenerが受け取り、
  * このクラスへ処理を委譲する。入退室そのものの記録・振り分けはMembershipManagerが担う。
+ *
+ * 【変更点】再入室時の引継ぎ確認（「はい/いいえ」）で、実際にデータの引継ぎ・匿名化保存・
+ * 削除を行えるよう、InitialSetupServiceにWithdrawalRepository・DataSubjectRightsService・
+ * EvidenceRepository・AnonymizedDataRepositoryを渡すようにした。
+ * いずれも記憶層・退会機能が既に持っているインスタンスをそのまま共有する
+ * （TsumugiApplication側で同じインスタンスを渡すこと）。
  */
 public final class InitialSetupManager {
 
@@ -48,23 +57,30 @@ public final class InitialSetupManager {
     /**
      * SQLiteベースの標準構成で組み立てるファクトリメソッド。
      *
-     * @param connectionFactory  共有DB（initial_setup等）用の接続ファクトリ
-     * @param withdrawalRepository  退会時の記名保持選択を参照して再入室時の
-     *                               引継ぎ確認要否を判定するために使う
-     *                               （TsumugiApplication側でWithdrawalManagerと同じインスタンスを共有すること）
-     * @param userDbRegistry  記憶層のユーザーごとDBフォルダを「表示名+登録日時」で
-     *                        割り当て・リネームするために使う
-     *                        （TsumugiApplication側で記憶層Repository群と同じインスタンスを共有すること）
+     * @param connectionFactory        共有DB（initial_setup等）用の接続ファクトリ
+     * @param withdrawalRepository     退会レコードの参照・削除（再入室時の引継ぎ判定・後始末）に使う
+     *                                 （TsumugiApplication側でWithdrawalManagerと同じインスタンスを共有すること）
+     * @param userDbRegistry           記憶層のユーザーごとDBフォルダを「表示名+登録日時」で
+     *                                 割り当て・リネームするために使う
+     *                                 （TsumugiApplication側で記憶層Repository群と同じインスタンスを共有すること）
+     * @param dataSubjectRightsService 引継ぎ辞退時、元データ（会話履歴・Evidence・UserModel）を
+     *                                 削除するために使う
+     * @param evidenceRepository       引継ぎ辞退時、匿名化保存の元となるEvidence全件を読み込むために使う
+     * @param anonymizedDataRepository 引継ぎ辞退時、匿名化したEvidenceの保存先
      */
     public static InitialSetupManager createDefault(SqliteConnectionFactory connectionFactory,
                                                       WithdrawalRepository withdrawalRepository,
-                                                      UserConnectionFactoryRegistry userDbRegistry) {
+                                                      UserConnectionFactoryRegistry userDbRegistry,
+                                                      DataSubjectRightsService dataSubjectRightsService,
+                                                      EvidenceRepository evidenceRepository,
+                                                      AnonymizedDataRepository anonymizedDataRepository) {
         InitialSetupRepository repository = new SqliteInitialSetupRepository(connectionFactory);
         InitialSetupChannelService channelService = new InitialSetupChannelService();
         ConsentManager consentManager = new ConsentManager();
         KickManager kickManager = new KickManager();
         InitialSetupService service = new InitialSetupService(
-                repository, channelService, consentManager, kickManager, userDbRegistry);
+                repository, channelService, consentManager, kickManager, userDbRegistry,
+                withdrawalRepository, dataSubjectRightsService, evidenceRepository, anonymizedDataRepository);
 
         MembershipRepository membershipRepository = new SqliteMembershipRepository(connectionFactory);
         MembershipManager membershipManager = new MembershipManager(membershipRepository, withdrawalRepository, service);
@@ -169,12 +185,25 @@ public final class InitialSetupManager {
     /**
      * 引継ぎ確認チャンネルへのメッセージ投稿を受け取ったときにInitialSetupListenerから呼ばれる。
      * WAITING_REJOIN_CONFIRM状態のユーザーでなければ何もしない。
+     * 「はい/いいえ」以外の入力だった場合は、再入力を促すメッセージを返す。
      */
     public void handleRejoinConfirmMessage(Member member, String rawText) {
         if (member.getUser().isBot()) return;
         try {
-            if (!service.isWaitingForRejoinConfirm(member.getIdLong(), member.getGuild().getIdLong())) return;
-            service.handleRejoinConfirmAnswer(member, rawText);
+            long userId = member.getIdLong();
+            long guildId = member.getGuild().getIdLong();
+            if (!service.isWaitingForRejoinConfirm(userId, guildId)) return;
+
+            boolean handled = service.handleRejoinConfirmAnswer(member, rawText);
+            if (!handled) {
+                var record = service.getRecord(userId, guildId);
+                if (record.setupChannelId != null) {
+                    var channel = member.getGuild().getTextChannelById(record.setupChannelId);
+                    if (channel != null) {
+                        channelService.postMessage(channel, "「はい」または「いいえ」でお答えください。");
+                    }
+                }
+            }
         } catch (RuntimeException e) {
             logger.warning("引継ぎ確認処理に失敗しました (userId=" + member.getIdLong() + "): " + e.getMessage());
         }

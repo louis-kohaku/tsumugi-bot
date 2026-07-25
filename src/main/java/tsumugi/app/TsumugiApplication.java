@@ -16,6 +16,8 @@ import tsumugi.llm.LaneLlmDispatcher;
 import tsumugi.llm.LlmClient;
 import tsumugi.llm.LlmLane;
 import tsumugi.llm.LmStudioGateway;
+import tsumugi.memory.anonymized.AnonymizedDataRepository;
+import tsumugi.memory.anonymized.SqliteAnonymizedDataRepository;
 import tsumugi.memory.consolidate.MemoryConsolidator;
 import tsumugi.memory.extract.EvidenceExtractor;
 import tsumugi.memory.retrieval.MemoryRetriever;
@@ -44,24 +46,23 @@ import java.util.logging.Logger;
 /**
  * 紬希の起動エントリーポイント。
  *
- * 【変更点: LM Studioへの問い合わせを1本のディスパッチャに集約】
- * 以前は会話応答・Evidence抽出・日記の総評生成がそれぞれ別スレッドから
- * LM Studioへ直接（並列に）問い合わせていたが、これをやめて
- * すべてLaneLlmDispatcher（ワーカースレッド1本）経由にした。
+ * 【変更点: 再入室時の引継ぎ確認（はい/いいえ）を実データに反映できるよう配線を追加】
+ * InitialSetupManager.createDefault() に、記憶層の各種Repository
+ * （DataSubjectRightsService / EvidenceRepository / AnonymizedDataRepository）を
+ * 渡すようにした。これにより、退会（記名保持）済みユーザーが再入室した際、
+ *   ・「はい」（引き継ぐ）→ 同じuserIdの既存DBフォルダをそのまま使い続ける
+ *   ・「いいえ」（引き継がない）→ Evidenceを匿名化して保存したうえで元データを削除する
+ * という実処理がInitialSetupService側で行えるようになる。
+ * いずれも下のブロックで元々生成済みのインスタンスをそのまま渡すだけで、
+ * 新規のコンポーネントは増えていない。
  *
- * レーンの構成:
- *  - CHAT : 通常会話の応答生成・記憶検索。軽量モデル（config.lmStudioChatModel）を使用。
- *  - DIARY: 日記の総評生成。CHATと同格の即時レーンで、重量モデル（config.lmStudioHeavyModel）を使用。
- *           一度生成が始まったら、会話が来ても完了まで中断しない。
- *  - HEAVY: Evidence抽出（性格・感情分析）。重量モデルを共用。CHAT/DIARYが無く、
- *           一定時間アイドルが続いた場合にのみ着手する。
- *
- * ルールは「実行中のタスクは中断しない」の1点のみで、優先度は
- * ワーカーが空いた瞬間に次に何を選ぶかだけに作用する（詳細はLaneLlmDispatcher参照）。
+ * 【変更点: LM Studioへの問い合わせを1本のディスパッチャに集約】（既存）
+ * 会話応答・Evidence抽出・日記の総評生成のLM Studio呼び出しは全てLaneLlmDispatcher
+ * （ワーカースレッド1本）経由に集約されている。詳細はLaneLlmDispatcher参照。
  *
  * DB構成（変更なし）:
  *  - 共有DB（config.dbPath）: initial_setup / withdrawal / membership_events /
- *    user_db_folders / diary_records / diary_queue など。
+ *    user_db_folders / diary_records / diary_queue / anonymized_evidence など。
  *  - ユーザーごとDB（config.userDbDir/{表示名+登録日時}/tsumugi.db）: episodic_events /
  *    evidence / evidence_vec / user_model など。
  */
@@ -98,11 +99,20 @@ public final class TsumugiApplication {
         DataSubjectRightsService dataSubjectRightsService = new DataSubjectRightsService(
                 episodicEventRepository, evidenceRepository, userModelRepository);
 
-        // ── 退会機能のRepositoryを先に生成（初期設定側のMembershipManagerと共有するため） ──
+        // 退会時「匿名化して保存」・再入室時「引継ぎ辞退（匿名化保存）」の両方で使う匿名データの保存先。
+        // 個人と紐付く情報は一切保存しない（AnonymizedDataRepository参照）。
+        AnonymizedDataRepository anonymizedDataRepository = new SqliteAnonymizedDataRepository(sharedConnectionFactory);
+
+        // ── 退会機能のRepositoryを先に生成（初期設定側のMembershipManager/InitialSetupServiceと共有するため） ──
         WithdrawalRepository withdrawalRepository = new SqliteWithdrawalRepository(sharedConnectionFactory);
 
-        InitialSetupManager initialSetupManager =
-                InitialSetupManager.createDefault(sharedConnectionFactory, withdrawalRepository, userDbRegistry);
+        InitialSetupManager initialSetupManager = InitialSetupManager.createDefault(
+                sharedConnectionFactory,
+                withdrawalRepository,
+                userDbRegistry,
+                dataSubjectRightsService,
+                evidenceRepository,
+                anonymizedDataRepository);
         InitialSetupListener initialSetupListener = new InitialSetupListener(initialSetupManager);
 
         // ── LLM連携層のセットアップ ────────────────────

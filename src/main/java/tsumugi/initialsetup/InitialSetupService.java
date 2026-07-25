@@ -3,12 +3,18 @@ package tsumugi.initialsetup;
 import net.dv8tion.jda.api.entities.Guild;
 import net.dv8tion.jda.api.entities.Member;
 import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
+import tsumugi.core.model.TsumugiModel.Evidence;
 import tsumugi.initialsetup.InitialSetupChannelService.GardenChannels;
 import tsumugi.initialsetup.model.InitialSetupRecord;
 import tsumugi.initialsetup.store.InitialSetupRepository;
+import tsumugi.memory.anonymized.AnonymizedDataRepository;
+import tsumugi.memory.rights.DataSubjectRightsService;
+import tsumugi.memory.store.EvidenceRepository;
 import tsumugi.memory.store.sqlite.UserConnectionFactoryRegistry;
+import tsumugi.withdrawal.store.WithdrawalRepository;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -39,8 +45,22 @@ import java.util.logging.Logger;
  * 退会（記名保持）→再入室時:
  *   startRejoinConfirm() で確認チャンネルを作成しWAITING_REJOIN_CONFIRMへ
  *   → handleRejoinConfirmAnswer() で「はい/いいえ」を受け、
- *     「はい」の場合は通常の名前入力後と同じ利用規約同意フロー（WAITING_CONSENT）へ進み、
- *     「いいえ」の場合は通常フロー（WAITING_NAME）へ切り替える
+ *
+ *     「はい」の場合:
+ *       - ユーザーIDは退会前・再入室後で不変（Discordの数値ID）なので、
+ *         これをキーに記憶層（ユーザーごとDBフォルダ）を特定し、そのまま使い続ける。
+ *         今名乗った表示名でフォルダ名だけを更新（renameUser）し、中身（会話履歴・
+ *         Evidence・UserModel）には一切手を加えない。
+ *       - 記憶を引き継ぐ前提で、通常フローと同じ利用規約同意（WAITING_CONSENT）を挟む。
+ *       - 決着したのでwithdrawalレコードは削除し、二度と引継ぎ確認が誤発火しないようにする。
+ *
+ *     「いいえ」の場合:
+ *       - 表示名を忘れている／変えているケースを想定し、本人と紐付く形での「保持」は
+ *         意味を失うと判断し、退会時の「1: 匿名化して保存」と同じ処理を行う。
+ *         Evidence全件を読み込み→匿名化してAnonymizedDataRepositoryへ保存→
+ *         元データ（会話履歴・Evidence・UserModel）はDataSubjectRightsService.forgetUser()
+ *         で削除する。会話ログ（EpisodicEvent）は匿名化せず削除のみ（退会フローと同方針）。
+ *       - withdrawalレコードを削除したうえで、通常の新規フロー（WAITING_NAME）へ切り替える。
  */
 public final class InitialSetupService {
     private volatile java.util.function.Consumer<Member> onDisplayNameConfirmed;
@@ -70,6 +90,18 @@ public final class InitialSetupService {
     private final KickManager kickManager;
     private final UserConnectionFactoryRegistry userDbRegistry;
 
+    /** 退会（記名保持）レコードの参照・削除に使う。再入室時の引継ぎ判定・後始末に必要。 */
+    private final WithdrawalRepository withdrawalRepository;
+
+    /** 「いいえ」選択時、元データ（会話履歴・Evidence・UserModel）を削除するために使う。 */
+    private final DataSubjectRightsService dataSubjectRightsService;
+
+    /** 「いいえ」選択時、Evidenceを匿名化して保存する前段としてEvidence全件を読み込むために使う。 */
+    private final EvidenceRepository evidenceRepository;
+
+    /** 「いいえ」選択時、匿名化したEvidenceの保存先。 */
+    private final AnonymizedDataRepository anonymizedDataRepository;
+
     /** 利用規約同意の1分タイムアウト監視専用スケジューラ。 */
     private final ScheduledExecutorService consentScheduler =
             Executors.newSingleThreadScheduledExecutor(r -> {
@@ -85,12 +117,20 @@ public final class InitialSetupService {
                                 InitialSetupChannelService channelService,
                                 ConsentManager consentManager,
                                 KickManager kickManager,
-                                UserConnectionFactoryRegistry userDbRegistry) {
+                                UserConnectionFactoryRegistry userDbRegistry,
+                                WithdrawalRepository withdrawalRepository,
+                                DataSubjectRightsService dataSubjectRightsService,
+                                EvidenceRepository evidenceRepository,
+                                AnonymizedDataRepository anonymizedDataRepository) {
         this.repository = repository;
         this.channelService = channelService;
         this.consentManager = consentManager;
         this.kickManager = kickManager;
         this.userDbRegistry = userDbRegistry;
+        this.withdrawalRepository = withdrawalRepository;
+        this.dataSubjectRightsService = dataSubjectRightsService;
+        this.evidenceRepository = evidenceRepository;
+        this.anonymizedDataRepository = anonymizedDataRepository;
     }
 
     /** サーバー参加時に呼ばれるエントリーポイント。入室チャンネルの存在保証と、状態をWAITING_NAMEにするだけ。 */
@@ -311,15 +351,27 @@ public final class InitialSetupService {
      * 確認チャンネルでの「はい/いいえ」回答を処理する。
      * WAITING_REJOIN_CONFIRM以外の状態のユーザーからの投稿は無視する。
      *
-     * 「はい」の場合は、記憶を引き継ぐ前提として通常の名前入力後と同じ
-     * 利用規約同意フロー（WAITING_CONSENT）へ進める。
-     * 「いいえ」の場合は、通常の初期設定フロー（WAITING_NAME）へ切り替える。
+     * 「はい」の場合:
+     *   ユーザーIDは不変のため、同じuserIdの既存DBフォルダ（前回の会話履歴・Evidence・
+     *   UserModelが入ったSQLiteファイル）をそのまま使い続ける。フォルダ名だけ今の
+     *   表示名に更新する（renameUser）。記憶を引き継ぐ前提として、通常の名前入力後と
+     *   同じ利用規約同意フロー（WAITING_CONSENT）へ進める。
+     *
+     * 「いいえ」の場合:
+     *   本人と紐付く形での保持は意味を失うため、退会時の「匿名化して保存」と同じ処理
+     *   （Evidenceを匿名化してAnonymizedDataRepositoryへ保存 → 元データは削除）を行い、
+     *   通常の初期設定フロー（WAITING_NAME）へ切り替える。
+     *
+     * どちらの場合も、決着後はwithdrawalレコードを削除し、
+     * 以後同じuserIdで再入室しても二度と引継ぎ確認が発生しないようにする。
      *
      * @return 有効な回答として処理できた場合true（呼び出し側でのメッセージ送信要否判断に使う）
      */
     public boolean handleRejoinConfirmAnswer(Member member, String rawText) {
         Guild guild = member.getGuild();
-        InitialSetupRecord record = repository.load(member.getIdLong(), guild.getIdLong());
+        long userId = member.getIdLong();
+        long guildId = guild.getIdLong();
+        InitialSetupRecord record = repository.load(userId, guildId);
         if (record.state != InitialSetupState.WAITING_REJOIN_CONFIRM) {
             return false;
         }
@@ -334,14 +386,27 @@ public final class InitialSetupService {
                 var oldChannel = guild.getTextChannelById(confirmChannelId);
                 if (oldChannel != null) channelService.deleteChannel(oldChannel);
             }
-            // 引継ぎ承諾 → 記憶を引き継ぐ前提で、通常フローと同じく利用規約同意を挟む
+
+            // 引継ぎ承諾 → 今の表示名で、既存のユーザー用DB（前回の記憶）をそのまま使い続ける。
+            // 記憶を引き継ぐ前提として、通常フローと同じく利用規約同意を挟む。
+            String currentDisplayName = member.getEffectiveName();
+            record.displayName = currentDisplayName;
             startConsentFlow(guild, member, record);
-            logger.info("記憶の引継ぎを承諾し、利用規約同意フローへ進みました: userId=" + member.getIdLong());
+
+            clearWithdrawalRecord(userId, guildId);
+            logger.info("記憶の引継ぎを承諾し、利用規約同意フローへ進みました: userId=" + userId);
             return true;
+
         } else if (answer.contains(NO_KEYWORD)) {
+            // 引継ぎ辞退 → 本人と紐付く形での保持は意味を失うため、
+            // 退会時の「匿名化して保存」と同じ処理を行う（Evidenceのみ匿名化保存、他は削除）。
+            anonymizeAndForget(userId);
+            clearWithdrawalRecord(userId, guildId);
+
             transition(record, InitialSetupState.WAITING_NAME);
             channelService.ensureEntryChannel(guild);
-            logger.info("記憶の引継ぎを辞退したため、通常の初期設定フローへ切り替えました: userId=" + member.getIdLong());
+            logger.info("記憶の引継ぎを辞退したため、旧データを匿名化保存のうえ削除しました: userId=" + userId);
+
         } else {
             return false; // 「はい」「いいえ」以外は無視（呼び出し側で再入力を促す）
         }
@@ -354,6 +419,27 @@ public final class InitialSetupService {
             if (channel != null) channelService.deleteChannel(channel);
         }
         return true;
+    }
+
+    /**
+     * 「いいえ」選択時の後始末。退会フローのhandleAnonymize()と同じ考え方で、
+     * Evidence（ステータス問わず全件）を匿名化してAnonymizedDataRepositoryへ保存したうえで、
+     * 元データ（会話履歴・Evidence・UserModel）をDataSubjectRightsService.forgetUser()で削除する。
+     * 会話ログ（EpisodicEvent）は退会フローと同様、匿名化の対象外（削除のみ）とする。
+     */
+    private void anonymizeAndForget(long userId) {
+        try {
+            List<Evidence> evidences = evidenceRepository.loadAll(userId);
+            anonymizedDataRepository.saveAnonymized(evidences);
+        } catch (RuntimeException e) {
+            logger.warning("引継ぎ辞退に伴うEvidence匿名化に失敗しました (userId=" + userId + "): " + e.getMessage());
+        }
+        dataSubjectRightsService.forgetUser(userId);
+    }
+
+    /** 引継ぎ確認が決着した後、二度と同じ確認フローが誤発火しないよう退会レコードを消す。 */
+    private void clearWithdrawalRecord(long userId, long guildId) {
+        withdrawalRepository.delete(userId, guildId);
     }
 
     private void transition(InitialSetupRecord record, InitialSetupState next) {
