@@ -14,12 +14,14 @@ import net.dv8tion.jda.api.hooks.ListenerAdapter;
  *
  * 拾うメッセージ:
  *  - 入室チャンネル（🌼｜入室）: 名前入力として処理
+ *  - 利用規約同意チャンネル（🌼｜利用規約確認-ユーザー名）: 「同意する/同意しない」の回答として処理
  *  - 引継ぎ確認チャンネル（🌼｜確認-ユーザー名）: 「はい/いいえ」の回答として処理
  * それ以外のチャンネルのメッセージには一切反応しない（通常会話はDiscordAdapter側の担当）。
  */
 public final class InitialSetupListener extends ListenerAdapter {
 
     private static final String ENTRY_CHANNEL_NAME = "🌼｜入室";
+    private static final String CONSENT_CHANNEL_PREFIX = "🌼｜利用規約確認-";
     private static final String REJOIN_CONFIRM_CHANNEL_PREFIX = "🌼｜確認-";
 
     private final InitialSetupManager manager;
@@ -54,6 +56,11 @@ public final class InitialSetupListener extends ListenerAdapter {
 
         if (ENTRY_CHANNEL_NAME.equals(channelName)) {
             manager.handleEntryChannelMessage(member, text);
+            return;
+        }
+
+        if (channelName != null && channelName.startsWith(CONSENT_CHANNEL_PREFIX)) {
+            manager.handleConsentChannelMessage(member, text);
             return;
         }
 

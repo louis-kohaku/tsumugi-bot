@@ -153,6 +153,20 @@ public final class InitialSetupManager {
     }
 
     /**
+     * 利用規約同意チャンネルへのメッセージ投稿を受け取ったときにInitialSetupListenerから呼ばれる。
+     * WAITING_CONSENT状態のユーザーでなければ何もしない。
+     */
+    public void handleConsentChannelMessage(Member member, String rawText) {
+        if (member.getUser().isBot()) return;
+        try {
+            if (!service.isWaitingForConsent(member.getIdLong(), member.getGuild().getIdLong())) return;
+            service.handleConsentAnswer(member, rawText);
+        } catch (RuntimeException e) {
+            logger.warning("同意確認処理に失敗しました (userId=" + member.getIdLong() + "): " + e.getMessage());
+        }
+    }
+
+    /**
      * 引継ぎ確認チャンネルへのメッセージ投稿を受け取ったときにInitialSetupListenerから呼ばれる。
      * WAITING_REJOIN_CONFIRM状態のユーザーでなければ何もしない。
      */
@@ -181,5 +195,6 @@ public final class InitialSetupManager {
     public void shutdown() {
         kickManager.shutdown();
         channelService.shutdown();
+        service.shutdown();
     }
 }
