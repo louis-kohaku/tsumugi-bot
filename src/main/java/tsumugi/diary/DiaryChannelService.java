@@ -22,6 +22,17 @@ import java.util.logging.Logger;
  * 要望部屋は「🌼｜要望」カテゴリ配下に、ユーザーごとの個人チャンネル
  * （🌼｜要望-ユーザー名）を配置する構成とする（InitialSetupChannelServiceの
  * 「紬希の庭」カテゴリと同じ構造）。
+ *
+ * 【修正】以前のensureRequestRoom()は、組み立てたチャンネル名とカテゴリ配下の
+ * 既存チャンネル名を文字列一致で比較して「既存チャンネルか」を判定していたが、
+ * Discordがチャンネル名を自動正規化（英字の小文字化等）するため、表示名に
+ * アルファベット大文字を含むユーザー等でこの一致判定が常に失敗し、
+ * 呼び出すたびに新規チャンネルが量産されてしまうバグがあった。
+ *
+ * 対応として、既存チャンネルの特定は呼び出し元（DiaryManager）が
+ * DiaryRequestRoomRepositoryから読み出した「既知のチャンネルID」で行うように変更した。
+ * このクラス自身は「そのIDのチャンネルが実在するか」をguild.getTextChannelById()で
+ * 確認するだけになり、名前の正規化ルールには一切依存しない。
  */
 public final class DiaryChannelService {
 
@@ -81,24 +92,30 @@ public final class DiaryChannelService {
         return buildName(REQUEST_CATEGORY_NAME, displayName);
     }
 
-    /** チャンネル名が要望カテゴリ配下の個人チャンネル命名規則に一致するか判定する。 */
+    /** チャンネル名が要望カテゴリ配下の個人チャンネル命名規則に一致するか判定する（ルーティング判定専用。同一性の特定には使わない）。 */
     public boolean isRequestRoomName(String channelName) {
         return channelName != null && channelName.startsWith(CHANNEL_PREFIX + REQUEST_CATEGORY_NAME + "-");
     }
 
     /**
-     * 対象ユーザー専用の要望部屋を、要望カテゴリ配下に作成する。既にあれば何もしない（冪等）。
+     * 対象ユーザー専用の要望部屋を、要望カテゴリ配下に作成する（既にあれば何もしない・冪等）。
      * 対象ユーザー・Bot・管理者ロールのみ閲覧可能（@everyoneには非表示）。
+     *
+     * @param knownChannelId 呼び出し元（DiaryRequestRoomRepository）に記録済みの、
+     *                       このユーザーの要望部屋チャンネルID。未登録・不明ならnull。
+     *                       nullでない場合はまずこのIDで実在確認し、実在すればそれを返す
+     *                       （名前の一致判定は一切行わない）。
      */
-    public TextChannel ensureRequestRoom(Guild guild, Member targetMember, String displayName) {
+    public TextChannel ensureRequestRoom(Guild guild, Member targetMember, String displayName, Long knownChannelId) {
+        if (knownChannelId != null) {
+            TextChannel existing = guild.getTextChannelById(knownChannelId);
+            if (existing != null) return existing;
+            logger.info("記録済みの要望部屋チャンネルが見つからなかったため、再作成します: userId="
+                    + targetMember.getIdLong() + " knownChannelId=" + knownChannelId);
+        }
+
         Category category = ensureRequestCategory(guild);
         String name = requestRoomName(displayName);
-
-        TextChannel existing = category.getTextChannels().stream()
-                .filter(c -> c.getName().equals(sanitize(name)))
-                .findFirst().orElse(null);
-        if (existing != null) return existing;
-
         return createRequestRoom(guild, category, targetMember, name);
     }
 

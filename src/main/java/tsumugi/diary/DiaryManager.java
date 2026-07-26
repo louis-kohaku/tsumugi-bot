@@ -7,20 +7,31 @@ import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import tsumugi.diary.model.DiaryQueueEntry;
 import tsumugi.diary.store.DiaryQueueRepository;
 import tsumugi.diary.store.DiaryRepository;
+import tsumugi.diary.store.DiaryRequestRoomRepository;
 import tsumugi.diary.store.sqlite.SqliteDiaryQueueRepository;
 import tsumugi.diary.store.sqlite.SqliteDiaryRepository;
+import tsumugi.diary.store.sqlite.SqliteDiaryRequestRoomRepository;
 import tsumugi.initialsetup.InitialSetupState;
 import tsumugi.initialsetup.model.InitialSetupRecord;
 import tsumugi.initialsetup.store.InitialSetupRepository;
 import tsumugi.llm.LlmClient;
 import tsumugi.memory.store.sqlite.SqliteConnectionFactory;
 
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
 /**
  * 日記機能全体の組み立て・エントリーポイントを担うファサード。
  *
- * 【変更点】日記部屋へのアクセス集中対策として、セッション完了（最後の質問への回答）を
+ * 【修正】要望部屋（🌼｜要望-ユーザー名）の取得・作成を、DiaryChannelService内での
+ * チャンネル名一致判定に頼らず、DiaryRequestRoomRepositoryに保存した「既知のチャンネルID」
+ * を介して行うように変更した。Discordのチャンネル名自動正規化により名前一致判定が
+ * 失敗し、/日記実行や起動時バックフィルのたびに要望部屋が量産されていたバグへの対応。
+ *
+ * あわせて、同一ユーザーに対するensureRequestRoomPersisted()の同時実行（多重作成）を
+ * 防ぐため、userId単位のロックを設けた。
+ *
+ * 【変更なし】日記部屋へのアクセス集中対策として、セッション完了（最後の質問への回答）を
  * 受けた時点では要約生成をその場で行わず、diary_queue（SQL永続キュー）へ積むだけにした。
  * インメモリのDiarySessionはここで即座に破棄し、待機中のデータはSQLにのみ保持する。
  * 実際の生成処理はDiaryQueueWorkerがバックグラウンドで順番に行う。
@@ -38,17 +49,23 @@ public final class DiaryManager {
     private final DiaryQueueRepository queueRepository;
     private final DiaryQueueWorker queueWorker;
     private final InitialSetupRepository initialSetupRepository;
+    private final DiaryRequestRoomRepository requestRoomRepository;
+
+    /** userId単位のロック。要望部屋の存在確認〜作成〜ID保存までを1ユーザーにつき1本の流れに直列化する。 */
+    private final ConcurrentHashMap<Long, Object> requestRoomLocks = new ConcurrentHashMap<>();
 
     public DiaryManager(DiarySessionManager sessionManager,
                          DiaryChannelService channelService,
                          DiaryQueueRepository queueRepository,
                          DiaryQueueWorker queueWorker,
-                         InitialSetupRepository initialSetupRepository) {
+                         InitialSetupRepository initialSetupRepository,
+                         DiaryRequestRoomRepository requestRoomRepository) {
         this.sessionManager = sessionManager;
         this.channelService = channelService;
         this.queueRepository = queueRepository;
         this.queueWorker = queueWorker;
         this.initialSetupRepository = initialSetupRepository;
+        this.requestRoomRepository = requestRoomRepository;
     }
 
     /**
@@ -62,12 +79,14 @@ public final class DiaryManager {
                                                InitialSetupRepository initialSetupRepository) {
         DiaryRepository repository = new SqliteDiaryRepository(connectionFactory);
         DiaryQueueRepository queueRepository = new SqliteDiaryQueueRepository(connectionFactory);
+        DiaryRequestRoomRepository requestRoomRepository = new SqliteDiaryRequestRoomRepository(connectionFactory);
         DiarySummaryGenerator summaryGenerator = new DiarySummaryGenerator(diaryLlmClient);
         DiaryService service = new DiaryService(repository, summaryGenerator);
         DiaryChannelService channelService = new DiaryChannelService();
         DiaryQueueWorker queueWorker = new DiaryQueueWorker(queueRepository, service, channelService);
 
-        return new DiaryManager(new DiarySessionManager(), channelService, queueRepository, queueWorker, initialSetupRepository);
+        return new DiaryManager(new DiarySessionManager(), channelService, queueRepository, queueWorker,
+                initialSetupRepository, requestRoomRepository);
     }
 
     /**
@@ -95,7 +114,7 @@ public final class DiaryManager {
             if (member == null) continue; // 既に離脱済み等
 
             try {
-                channelService.ensureRequestRoom(guild, member, record.displayName);
+                ensureRequestRoomPersisted(guild, member, record.displayName);
             } catch (RuntimeException e) {
                 logger.warning("要望部屋のバックフィルに失敗しました (userId=" + record.userId + "): " + e.getMessage());
             }
@@ -108,9 +127,35 @@ public final class DiaryManager {
 
     public void onMemberDisplayNameConfirmed(Member member) {
         try {
-            channelService.ensureRequestRoom(member.getGuild(), member, member.getEffectiveName());
+            ensureRequestRoomPersisted(member.getGuild(), member, member.getEffectiveName());
         } catch (RuntimeException e) {
             logger.warning("要望部屋の作成に失敗しました (userId=" + member.getIdLong() + "): " + e.getMessage());
+        }
+    }
+
+    /** /日記が要望部屋以外で実行された場合のフォールバック用に、対象ユーザーの要望部屋を返す。 */
+    public TextChannel getOrCreateRequestRoom(Member member) {
+        return ensureRequestRoomPersisted(member.getGuild(), member, member.getEffectiveName());
+    }
+
+    /**
+     * 要望部屋の「既知のチャンネルID確認 → 無ければ作成 → IDを保存」までを、
+     * 同一ユーザーについて直列化した上で行う共通処理。
+     * getOrCreateRequestRoom() / onMemberDisplayNameConfirmed() / bootstrapGuilds()の
+     * 3経路全てがこれを経由することで、どこから呼ばれても要望部屋が重複作成されないようにする。
+     */
+    private TextChannel ensureRequestRoomPersisted(Guild guild, Member member, String displayName) {
+        long userId = member.getIdLong();
+        Object lock = requestRoomLocks.computeIfAbsent(userId, k -> new Object());
+
+        synchronized (lock) {
+            Long knownChannelId = requestRoomRepository.loadChannelId(userId);
+            TextChannel channel = channelService.ensureRequestRoom(guild, member, displayName, knownChannelId);
+
+            if (knownChannelId == null || knownChannelId != channel.getIdLong()) {
+                requestRoomRepository.save(userId, channel.getIdLong());
+            }
+            return channel;
         }
     }
 
@@ -160,11 +205,6 @@ public final class DiaryManager {
             logger.warning("日記セッション処理に失敗しました (userId=" + userId + "): " + e.getMessage());
             channelService.postMessage(channel, "エラーが発生しました。少し時間をおいて、もう一度お試しください。");
         }
-    }
-
-    /** /日記が要望部屋以外で実行された場合のフォールバック用に、対象ユーザーの要望部屋を返す。 */
-    public TextChannel getOrCreateRequestRoom(Member member) {
-        return channelService.ensureRequestRoom(member.getGuild(), member, member.getEffectiveName());
     }
 
     public boolean isRequestRoomName(String channelName) {
