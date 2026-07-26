@@ -16,6 +16,11 @@ import java.util.logging.Logger;
  * initialsetup.InitialSetupChannelServiceと同じ命名規則（🌼｜チャンネル名）に揃える。
  *
  * 閲覧・投稿可能: 対象ユーザー、Bot自身、管理者のみ。@everyoneには非表示。
+ *
+ * 【変更点】常設の「退会希望」チャンネルは@everyoneに見えるため、
+ * WithdrawalListener側で投稿された「退会」発言をその場で即時削除できるよう、
+ * Bot自身の権限にMESSAGE_MANAGEを追加した（メソッドのシグネチャ・既存の呼び出し元への
+ * 影響は一切なし）。
  */
 public final class WithdrawalChannelService {
 
@@ -84,7 +89,8 @@ public final class WithdrawalChannelService {
                         List.of(Permission.VIEW_CHANNEL, Permission.MESSAGE_SEND, Permission.MESSAGE_HISTORY),
                         null)
                 .addPermissionOverride(guild.getSelfMember(),
-                        List.of(Permission.VIEW_CHANNEL, Permission.MESSAGE_SEND, Permission.MANAGE_CHANNEL),
+                        List.of(Permission.VIEW_CHANNEL, Permission.MESSAGE_SEND, Permission.MANAGE_CHANNEL,
+                                Permission.MESSAGE_MANAGE),
                         null)
                 .complete();
         channel.sendMessage(WITHDRAWAL_REQUEST_STANDING_MESSAGE).queue();
@@ -96,6 +102,7 @@ public final class WithdrawalChannelService {
      * 5秒後に退会希望チャンネルを一度削除し、まっさらな状態で作り直す。
      * 「退会」発言など直近のやり取りを残さないためのリセット処理
      * （initialsetupの入室チャンネルと同じ方式）。
+     * 【備考】WithdrawalListener側で投稿の即時削除も行うため、これは二重の安全策として残す。
      */
     public void scheduleWithdrawalRequestChannelRecreate(Guild guild) {
         scheduler.schedule(() -> {
