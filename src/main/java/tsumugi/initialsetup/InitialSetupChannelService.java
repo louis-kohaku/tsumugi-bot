@@ -22,6 +22,8 @@ import java.util.logging.Logger;
  *  - 入室チャンネル: サーバーに1つだけ常設。@everyoneに見える固定案内文を常に表示し、
  *    ここに「読んでほしい名前」が投稿されたことをトリガーに初期設定を進める。
  *    使用後は一度削除→再作成することで、常にまっさらな状態を保つ。
+ *    【変更点】あわせて、InitialSetupListener側で投稿された個人的な入力（名前など）を
+ *    その場で即時削除できるよう、Bot自身の権限にMESSAGE_MANAGEを追加した。
  *  - 利用規約確認-ユーザー名: 名前入力直後、本人専用に作成する一時チャンネル。
  *    利用規約への同意可否をここで確認する。
  *  - 紬希の庭-ユーザー名（カテゴリ）: 本人専用。配下に 雑談部屋/ログ部屋/お知らせ部屋 を作成する。
@@ -90,7 +92,8 @@ public final class InitialSetupChannelService {
                         List.of(Permission.VIEW_CHANNEL, Permission.MESSAGE_SEND, Permission.MESSAGE_HISTORY),
                         null)
                 .addPermissionOverride(guild.getSelfMember(),
-                        List.of(Permission.VIEW_CHANNEL, Permission.MESSAGE_SEND, Permission.MANAGE_CHANNEL),
+                        List.of(Permission.VIEW_CHANNEL, Permission.MESSAGE_SEND, Permission.MANAGE_CHANNEL,
+                                Permission.MESSAGE_MANAGE),
                         null)
                 .complete();
         channel.sendMessage(ENTRY_CHANNEL_STANDING_MESSAGE).queue();
@@ -101,6 +104,7 @@ public final class InitialSetupChannelService {
     /**
      * 5秒後に入室チャンネルを一度削除し、まっさらな状態で作り直す。
      * 直近のやり取り（前のユーザーの入力メッセージ等）を残さないためのリセット処理。
+     * 【備考】InitialSetupListener側で投稿の即時削除も行うため、これは二重の安全策として残す。
      */
     public void scheduleEntryChannelRecreate(Guild guild) {
         scheduler.schedule(() -> {
