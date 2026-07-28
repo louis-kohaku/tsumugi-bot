@@ -2,6 +2,8 @@ package tsumugi.app;
 
 import net.dv8tion.jda.api.JDA;
 import okhttp3.OkHttpClient;
+import tsumugi.broadcast.BroadcastListener;
+import tsumugi.broadcast.BroadcastManager;
 import tsumugi.conversation.ConversationEngine;
 import tsumugi.core.model.TsumugiModel.Evidence;
 import tsumugi.core.model.TsumugiModel.EvidenceCategory;
@@ -46,23 +48,25 @@ import java.util.logging.Logger;
 /**
  * 紬希の起動エントリーポイント。
  *
- * 【変更点: 再入室時の引継ぎ確認（はい/いいえ）を実データに反映できるよう配線を追加】
+ * 【変更点: お知らせ配信機能の追加】
+ * Kohaku専用の「🌼｜お知らせ配信」チャンネルに投稿した内容をLLMで校正チェックし、
+ * 確認（はい/いいえ、往復修正可）のうえで初期設定完了済み全ユーザーの
+ * お知らせ部屋（announceChannelId）へ一斉配信する機能を追加した。
+ * LLM呼び出しは新設のLlmLane.BROADCAST（CHATと同格の即時レーン、重量モデル使用）経由で行う。
+ *
+ * 【既存: 再入室時の引継ぎ確認（はい/いいえ）を実データに反映できるよう配線】
  * InitialSetupManager.createDefault() に、記憶層の各種Repository
  * （DataSubjectRightsService / EvidenceRepository / AnonymizedDataRepository）を
- * 渡すようにした。これにより、退会（記名保持）済みユーザーが再入室した際、
- *   ・「はい」（引き継ぐ）→ 同じuserIdの既存DBフォルダをそのまま使い続ける
- *   ・「いいえ」（引き継がない）→ Evidenceを匿名化して保存したうえで元データを削除する
- * という実処理がInitialSetupService側で行えるようになる。
- * いずれも下のブロックで元々生成済みのインスタンスをそのまま渡すだけで、
- * 新規のコンポーネントは増えていない。
+ * 渡すようにしている。
  *
- * 【変更点: LM Studioへの問い合わせを1本のディスパッチャに集約】（既存）
- * 会話応答・Evidence抽出・日記の総評生成のLM Studio呼び出しは全てLaneLlmDispatcher
- * （ワーカースレッド1本）経由に集約されている。詳細はLaneLlmDispatcher参照。
+ * 【既存: LM Studioへの問い合わせを1本のディスパッチャに集約】
+ * 会話応答・Evidence抽出・日記の総評生成・お知らせ文チェックのLM Studio呼び出しは全て
+ * LaneLlmDispatcher（ワーカースレッド1本）経由に集約されている。詳細はLaneLlmDispatcher参照。
  *
  * DB構成（変更なし）:
  *  - 共有DB（config.dbPath）: initial_setup / withdrawal / membership_events /
- *    user_db_folders / diary_records / diary_queue / anonymized_evidence など。
+ *    user_db_folders / diary_records / diary_queue / anonymized_evidence /
+ *    broadcast_history など。
  *  - ユーザーごとDB（config.userDbDir/{表示名+登録日時}/tsumugi.db）: episodic_events /
  *    evidence / evidence_vec / user_model など。
  */
@@ -125,7 +129,7 @@ public final class TsumugiApplication {
         // （設定ミスで即座に起動失敗にはせず、レーン分離自体は機能させる）。
         String heavyModel = config.lmStudioHeavyModel.isBlank() ? config.lmStudioChatModel : config.lmStudioHeavyModel;
         if (config.lmStudioHeavyModel.isBlank()) {
-            logger.warning("LM_STUDIO_HEAVY_MODELが未設定のため、日記・Evidence抽出も会話用モデルを使用します。");
+            logger.warning("LM_STUDIO_HEAVY_MODELが未設定のため、日記・Evidence抽出・お知らせ校正も会話用モデルを使用します。");
         }
 
         LmStudioGateway chatGateway = new LmStudioGateway(
@@ -133,14 +137,16 @@ public final class TsumugiApplication {
         LmStudioGateway heavyGateway = new LmStudioGateway(
                 config.lmStudioBaseUrl, heavyModel, config.lmStudioEmbeddingModel, httpClient);
 
-        // CHAT=軽量・即時最優先 / DIARY=重量・CHATと同格の即時 / HEAVY=重量・アイドル時のみ
+        // CHAT=軽量・即時最優先 / BROADCAST=重量・CHATと同格の即時 / DIARY=重量・CHATと同格の即時 / HEAVY=重量・アイドル時のみ
         Map<LlmLane, LlmClient> llmClientsByLane = new EnumMap<>(LlmLane.class);
         llmClientsByLane.put(LlmLane.CHAT, chatGateway);
+        llmClientsByLane.put(LlmLane.BROADCAST, heavyGateway);
         llmClientsByLane.put(LlmLane.DIARY, heavyGateway);
         llmClientsByLane.put(LlmLane.HEAVY, heavyGateway);
 
         Map<LlmLane, EmbeddingClient> embeddingClientsByLane = new EnumMap<>(LlmLane.class);
         embeddingClientsByLane.put(LlmLane.CHAT, chatGateway);
+        embeddingClientsByLane.put(LlmLane.BROADCAST, heavyGateway);
         embeddingClientsByLane.put(LlmLane.DIARY, heavyGateway);
         embeddingClientsByLane.put(LlmLane.HEAVY, heavyGateway);
 
@@ -148,6 +154,7 @@ public final class TsumugiApplication {
 
         LlmClient chatLlm = new LaneLlmClient(dispatcher, LlmLane.CHAT);
         LaneEmbeddingClient chatEmbed = new LaneEmbeddingClient(dispatcher, LlmLane.CHAT);
+        LlmClient broadcastLlm = new LaneLlmClient(dispatcher, LlmLane.BROADCAST);
         LlmClient diaryLlm = new LaneLlmClient(dispatcher, LlmLane.DIARY);
         LlmClient heavyLlm = new LaneLlmClient(dispatcher, LlmLane.HEAVY);
         LaneEmbeddingClient heavyEmbed = new LaneEmbeddingClient(dispatcher, LlmLane.HEAVY);
@@ -176,6 +183,13 @@ public final class TsumugiApplication {
 
         initialSetupManager.getService().setOnDisplayNameConfirmed(diaryManager::onMemberDisplayNameConfirmed);
 
+        // ── お知らせ配信機能のセットアップ（校正チェックはBROADCASTレーン） ──────────
+        tsumugi.initialsetup.store.InitialSetupRepository initialSetupRepositoryForBroadcast =
+                new tsumugi.initialsetup.store.sqlite.SqliteInitialSetupRepository(sharedConnectionFactory);
+        BroadcastManager broadcastManager = BroadcastManager.createDefault(
+                sharedConnectionFactory, broadcastLlm, initialSetupRepositoryForBroadcast);
+        BroadcastListener broadcastListener = new BroadcastListener(broadcastManager);
+
         // ── 会話エンジン（CHATレーン）・Evidence抽出層（HEAVYレーン）のセットアップ ──
         ConversationEngine conversationEngine = new ConversationEngine(
                 chatLlm, retriever, episodicEventRepository, userModelRepository);
@@ -197,10 +211,11 @@ public final class TsumugiApplication {
         DiscordAdapter adapter = new DiscordAdapter(
                 conversationEngine, episodicEventRepository, evidenceExtractor, dataSubjectRightsService);
         JDA jda = DiscordAdapter.start(config.discordToken, adapter,
-                initialSetupListener, withdrawalListener, diaryListener);
+                initialSetupListener, withdrawalListener, diaryListener, broadcastListener);
         initialSetupManager.bootstrapGuilds(jda);
         withdrawalManager.ensureWithdrawalRequestChannelsForAllGuilds(jda);
         diaryManager.bootstrapGuilds(jda); // ここでdiary_queueワーカーも起動する
+        broadcastManager.bootstrapGuilds(jda); // お知らせ配信チャンネルの存在保証
 
         jda.updateCommands().addCommands(tsumugi.diary.DiaryListener.commandData()).queue();
 
