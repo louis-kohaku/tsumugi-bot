@@ -48,46 +48,28 @@ src/main/java/tsumugi/forcedwithdrawal/
         └── SqliteForcedWithdrawalRepository.java  SQLite実装（forced_withdrawalテーブル、自前でマイグレーション）
 ```
 
-既存ファイルへの変更はありません。`TsumugiApplication.java` の起動処理だけ、
-下記の配線を追記する必要があります（このzipには含まれていないので、
-手元の `TsumugiApplication.java` に手動で追加してください）。
+## 今回の追加分: `TsumugiApplication.java`（丸ごと置き換え）
 
-## `TsumugiApplication.java` への追記が必要な箇所
+前回のパッチは新規ファイルのみで、既存の `TsumugiApplication.java` への配線は
+手動追記が必要でした。「強制退会チャンネルが起動できていない」件の原因はこれです
+（`ForcedWithdrawalManager.bootstrapGuilds(jda)` が呼ばれていないと
+`🌼｜強制退会` チャンネル自体が作成されません）。
 
-```java
-import tsumugi.forcedwithdrawal.ForcedWithdrawalListener;
-import tsumugi.forcedwithdrawal.ForcedWithdrawalManager;
+今回のzipには、配線済みの `src/main/java/tsumugi/app/TsumugiApplication.java` を
+**まるごと置き換え用として同梱**しています。差分適用ではなく、既存ファイルを
+このファイルでそのまま上書きしてください。
 
-// ... 既存のInitialSetupManager/WithdrawalManager生成のあと
+変更点は以下の3箇所のみです（他のロジックは元のファイルと同一）:
 
-ForcedWithdrawalManager forcedWithdrawalManager = ForcedWithdrawalManager.createDefault(
-        sharedConnectionFactory,
-        initialSetupRepositoryForDiary, // 既存の共有DB用InitialSetupRepositoryをそのまま流用
-        initialSetupManager.getChannelService(),
-        evidenceRepository,
-        anonymizedDataRepository,
-        dataSubjectRightsService);
-ForcedWithdrawalListener forcedWithdrawalListener = new ForcedWithdrawalListener(forcedWithdrawalManager);
-
-// JDA起動時のリスナー登録に追加
-JDA jda = DiscordAdapter.start(config.discordToken, adapter,
-        initialSetupListener, withdrawalListener, diaryListener, forcedWithdrawalListener);
-
-// 起動処理に追加
-initialSetupManager.bootstrapGuilds(jda);
-withdrawalManager.ensureWithdrawalRequestChannelsForAllGuilds(jda);
-diaryManager.bootstrapGuilds(jda);
-forcedWithdrawalManager.bootstrapGuilds(jda);
-
-// シャットダウンフックに追加
-Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-    // ...既存の処理...
-    forcedWithdrawalManager.shutdown();
-}));
-```
-
-`config.discordToken.isBlank()` の早期returnブロック内にも、他Managerと同様に
-`forcedWithdrawalManager.shutdown();` を追加しておくと安全です。
+1. `import` に `ForcedWithdrawalListener` / `ForcedWithdrawalManager` を追加
+2. お知らせ配信機能のセットアップの後に、強制退会機能のセットアップを追加
+   （`initialSetupManager.getChannelService()` / `evidenceRepository` /
+   `anonymizedDataRepository` / `dataSubjectRightsService` を共有）
+3. 以下の3箇所に `forcedWithdrawalManager` がらみの呼び出しを追加
+   - `DiscordAdapter.start(...)` のリスナー一覧に `forcedWithdrawalListener` を追加
+   - `forcedWithdrawalManager.bootstrapGuilds(jda);`（← これが無いとチャンネルが作られない）
+   - シャットダウンフック・Discordトークン未設定時の早期returnの両方に
+     `forcedWithdrawalManager.shutdown();` を追加
 
 ## データベース
 

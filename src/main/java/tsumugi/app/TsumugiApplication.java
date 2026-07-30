@@ -9,6 +9,8 @@ import tsumugi.core.model.TsumugiModel.Evidence;
 import tsumugi.core.model.TsumugiModel.EvidenceCategory;
 import tsumugi.core.model.TsumugiModel.Polarity;
 import tsumugi.discord.DiscordAdapter;
+import tsumugi.forcedwithdrawal.ForcedWithdrawalListener;
+import tsumugi.forcedwithdrawal.ForcedWithdrawalManager;
 import tsumugi.initialsetup.InitialSetupListener;
 import tsumugi.initialsetup.InitialSetupManager;
 import tsumugi.llm.EmbeddingClient;
@@ -48,7 +50,14 @@ import java.util.logging.Logger;
 /**
  * 紬希の起動エントリーポイント。
  *
- * 【変更点: お知らせ配信機能の追加】
+ * 【変更点: 強制退会機能の配線追加】
+ * 管理者が対象者を選んで強制的に退会させる tsumugi.forcedwithdrawal パッケージを配線した。
+ * InitialSetupManagerが既に持っている共有DB用InitialSetupRepository・InitialSetupChannelService、
+ * および記憶層のEvidenceRepository・AnonymizedDataRepository・DataSubjectRightsServiceを
+ * そのまま共有して組み立てる。JDA起動時のリスナー登録・bootstrapGuilds()呼び出し・
+ * シャットダウンフックへの追加が主な変更点（他機能への変更は無し）。
+ *
+ * 【既存: お知らせ配信機能の追加】
  * Kohaku専用の「🌼｜お知らせ配信」チャンネルに投稿した内容をLLMで校正チェックし、
  * 確認（はい/いいえ、往復修正可）のうえで初期設定完了済み全ユーザーの
  * お知らせ部屋（announceChannelId）へ一斉配信する機能を追加した。
@@ -66,7 +75,7 @@ import java.util.logging.Logger;
  * DB構成（変更なし）:
  *  - 共有DB（config.dbPath）: initial_setup / withdrawal / membership_events /
  *    user_db_folders / diary_records / diary_queue / anonymized_evidence /
- *    broadcast_history など。
+ *    broadcast_history / forced_withdrawal など。
  *  - ユーザーごとDB（config.userDbDir/{表示名+登録日時}/tsumugi.db）: episodic_events /
  *    evidence / evidence_vec / user_model など。
  */
@@ -103,8 +112,9 @@ public final class TsumugiApplication {
         DataSubjectRightsService dataSubjectRightsService = new DataSubjectRightsService(
                 episodicEventRepository, evidenceRepository, userModelRepository);
 
-        // 退会時「匿名化して保存」・再入室時「引継ぎ辞退（匿名化保存）」の両方で使う匿名データの保存先。
-        // 個人と紐付く情報は一切保存しない（AnonymizedDataRepository参照）。
+        // 退会時「匿名化して保存」・再入室時「引継ぎ辞退（匿名化保存）」・強制退会の
+        // いずれでも使う匿名データの保存先。個人と紐付く情報は一切保存しない
+        // （AnonymizedDataRepository参照）。
         AnonymizedDataRepository anonymizedDataRepository = new SqliteAnonymizedDataRepository(sharedConnectionFactory);
 
         // ── 退会機能のRepositoryを先に生成（初期設定側のMembershipManager/InitialSetupServiceと共有するため） ──
@@ -190,6 +200,21 @@ public final class TsumugiApplication {
                 sharedConnectionFactory, broadcastLlm, initialSetupRepositoryForBroadcast);
         BroadcastListener broadcastListener = new BroadcastListener(broadcastManager);
 
+        // ── 強制退会機能のセットアップ ────────────────────
+        // 初期設定側と同じ共有DB用InitialSetupRepository・InitialSetupChannelService、
+        // 記憶層のEvidenceRepository・AnonymizedDataRepository・DataSubjectRightsServiceを
+        // そのまま共有する（退会フローと同じ方針）。
+        tsumugi.initialsetup.store.InitialSetupRepository initialSetupRepositoryForForcedWithdrawal =
+                new tsumugi.initialsetup.store.sqlite.SqliteInitialSetupRepository(sharedConnectionFactory);
+        ForcedWithdrawalManager forcedWithdrawalManager = ForcedWithdrawalManager.createDefault(
+                sharedConnectionFactory,
+                initialSetupRepositoryForForcedWithdrawal,
+                initialSetupManager.getChannelService(),
+                evidenceRepository,
+                anonymizedDataRepository,
+                dataSubjectRightsService);
+        ForcedWithdrawalListener forcedWithdrawalListener = new ForcedWithdrawalListener(forcedWithdrawalManager);
+
         // ── 会話エンジン（CHATレーン）・Evidence抽出層（HEAVYレーン）のセットアップ ──
         ConversationEngine conversationEngine = new ConversationEngine(
                 chatLlm, retriever, episodicEventRepository, userModelRepository);
@@ -202,6 +227,7 @@ public final class TsumugiApplication {
             initialSetupManager.shutdown();
             withdrawalManager.shutdown();
             diaryManager.shutdown();
+            forcedWithdrawalManager.shutdown();
             dispatcher.shutdown();
             httpClient.dispatcher().executorService().shutdown();
             httpClient.connectionPool().evictAll();
@@ -211,11 +237,12 @@ public final class TsumugiApplication {
         DiscordAdapter adapter = new DiscordAdapter(
                 conversationEngine, episodicEventRepository, evidenceExtractor, dataSubjectRightsService);
         JDA jda = DiscordAdapter.start(config.discordToken, adapter,
-                initialSetupListener, withdrawalListener, diaryListener, broadcastListener);
+                initialSetupListener, withdrawalListener, diaryListener, broadcastListener, forcedWithdrawalListener);
         initialSetupManager.bootstrapGuilds(jda);
         withdrawalManager.ensureWithdrawalRequestChannelsForAllGuilds(jda);
         diaryManager.bootstrapGuilds(jda); // ここでdiary_queueワーカーも起動する
         broadcastManager.bootstrapGuilds(jda); // お知らせ配信チャンネルの存在保証
+        forcedWithdrawalManager.bootstrapGuilds(jda); // 強制退会チャンネルの存在保証・未完了スケジュールの再構築
 
         jda.updateCommands().addCommands(tsumugi.diary.DiaryListener.commandData()).queue();
 
@@ -227,6 +254,7 @@ public final class TsumugiApplication {
             initialSetupManager.shutdown();
             withdrawalManager.shutdown();
             diaryManager.shutdown();
+            forcedWithdrawalManager.shutdown();
             dispatcher.shutdown();
             jda.shutdown();
             httpClient.dispatcher().executorService().shutdown();
