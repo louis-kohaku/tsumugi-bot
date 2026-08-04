@@ -77,8 +77,8 @@ public final class TsumugiApplication {
 
         // ── LLM連携層のセットアップ ────────────────────
         OkHttpClient httpClient = new OkHttpClient.Builder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .readTimeout(Duration.ofSeconds(60))
+                .connectTimeout(Duration.ofSeconds(120))
+                .readTimeout(Duration.ofSeconds(600))
                 .build();
 
         LmStudioGateway llmGateway = new LmStudioGateway(
