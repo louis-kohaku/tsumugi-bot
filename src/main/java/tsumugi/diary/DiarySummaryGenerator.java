@@ -9,6 +9,9 @@ import java.util.logging.Logger;
 /**
  * DiaryRecordの内容から紬の総評（daily_summary）を生成する。
  * EvidenceExtractorと同じ構造でLlmClientを利用する。
+ *
+ * 【変更点】総評生成の最大トークン数（旧: 定数 MAX_TOKENS = 600 のハードコード）を、
+ * コンストラクタ引数として外部（AppConfig / .envの LLM_MAX_TOKENS_DIARY）から注入する形に変更した。
  */
 public final class DiarySummaryGenerator {
 
@@ -28,20 +31,23 @@ public final class DiarySummaryGenerator {
         出力は本文のみとし、見出しやMarkdown記法は使わないでください。
         """;
 
-    private static final int MAX_TOKENS = 600;
     private static final double TEMPERATURE = 0.7;
     private static final String FALLBACK_SUMMARY =
             "今日も一日お疲れさまでした😊 記録、ありがとうございました。";
 
     private final LlmClient llmClient;
 
-    public DiarySummaryGenerator(LlmClient llmClient) {
+    /** 総評生成に使う最大トークン数。AppConfig.llmMaxTokensDiary（.envの LLM_MAX_TOKENS_DIARY）から注入される。 */
+    private final int maxTokens;
+
+    public DiarySummaryGenerator(LlmClient llmClient, int maxTokens) {
         this.llmClient = llmClient;
+        this.maxTokens = maxTokens;
     }
 
     public String generate(DiaryRecord record) {
         String userPrompt = buildUserPrompt(record);
-        String summary = llmClient.call(SYSTEM_PROMPT, userPrompt, MAX_TOKENS, TEMPERATURE);
+        String summary = llmClient.call(SYSTEM_PROMPT, userPrompt, maxTokens, TEMPERATURE);
         if (summary == null || summary.isBlank()) {
             logger.warning("日記総評の生成に失敗しました (userId=" + record.userId + ")。フォールバック文言を使用します。");
             return FALLBACK_SUMMARY;

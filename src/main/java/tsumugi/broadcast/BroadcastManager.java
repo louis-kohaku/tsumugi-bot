@@ -17,6 +17,10 @@ import java.util.logging.Logger;
  * TsumugiApplication（起動処理）からはこのクラスだけを組み立てれば、
  * 内部の各コンポーネント（Repository/Service/ChannelService/Reviewer）を
  * 個別に意識せずに済むようにする（WithdrawalManager/DiaryManagerと同じ方針）。
+ *
+ * 【変更点】BroadcastReviewerが必要とする最大トークン数（maxTokens）を、
+ * createDefault()の引数として外部（AppConfig / .envの LLM_MAX_TOKENS_BROADCAST）から
+ * 受け取り、BroadcastReviewerのコンストラクタへそのまま渡すように変更した。
  */
 public final class BroadcastManager {
 
@@ -34,13 +38,16 @@ public final class BroadcastManager {
      * @param broadcastLlmClient お知らせ文チェックに使うLlmClient。
      *                           呼び出し側（TsumugiApplication）で LlmLane.BROADCAST に紐づいた
      *                           LaneLlmClient を渡すこと。
+     * @param maxTokens          お知らせ文の校正チェックに使う最大トークン数。
+     *                           AppConfig.llmMaxTokensBroadcast（.envの LLM_MAX_TOKENS_BROADCAST）を渡すこと。
      */
     public static BroadcastManager createDefault(SqliteConnectionFactory connectionFactory,
                                                    LlmClient broadcastLlmClient,
-                                                   InitialSetupRepository initialSetupRepository) {
+                                                   InitialSetupRepository initialSetupRepository,
+                                                   int maxTokens) {
         BroadcastRepository repository = new SqliteBroadcastRepository(connectionFactory);
         BroadcastChannelService channelService = new BroadcastChannelService();
-        BroadcastReviewer reviewer = new BroadcastReviewer(broadcastLlmClient);
+        BroadcastReviewer reviewer = new BroadcastReviewer(broadcastLlmClient, maxTokens);
         BroadcastService service = new BroadcastService(reviewer, channelService, repository, initialSetupRepository);
         return new BroadcastManager(service, channelService);
     }

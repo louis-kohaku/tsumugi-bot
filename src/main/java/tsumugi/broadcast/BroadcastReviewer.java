@@ -11,6 +11,9 @@ import java.util.logging.Logger;
  * 出力は本文のみを期待する（JSON等の構造化は行わない。配信文はそのまま
  * ユーザーへ表示されるため、余計な前置き・Markdown記法が混ざらないよう
  * システムプロンプト側で強く指示する）。
+ *
+ * 【変更点】校正チェックの最大トークン数（旧: 定数 MAX_TOKENS = 800 のハードコード）を、
+ * コンストラクタ引数として外部（AppConfig / .envの LLM_MAX_TOKENS_BROADCAST）から注入する形に変更した。
  */
 public final class BroadcastReviewer {
 
@@ -27,13 +30,16 @@ public final class BroadcastReviewer {
         見出し等は一切含めないでください。元の文章の意図・情報・絵文字の雰囲気はできる限り保ってください。
         """;
 
-    private static final int MAX_TOKENS = 800;
     private static final double TEMPERATURE = 0.3;
 
     private final LlmClient llmClient;
 
-    public BroadcastReviewer(LlmClient llmClient) {
+    /** 校正チェックに使う最大トークン数。AppConfig.llmMaxTokensBroadcast（.envの LLM_MAX_TOKENS_BROADCAST）から注入される。 */
+    private final int maxTokens;
+
+    public BroadcastReviewer(LlmClient llmClient, int maxTokens) {
         this.llmClient = llmClient;
+        this.maxTokens = maxTokens;
     }
 
     /**
@@ -43,7 +49,7 @@ public final class BroadcastReviewer {
     public String review(String rawContent) {
         if (rawContent == null || rawContent.isBlank()) return rawContent;
 
-        String result = llmClient.call(SYSTEM_PROMPT, rawContent, MAX_TOKENS, TEMPERATURE);
+        String result = llmClient.call(SYSTEM_PROMPT, rawContent, maxTokens, TEMPERATURE);
         if (result == null || result.isBlank()) {
             logger.warning("お知らせ文チェックのLLM応答が空だったため、元の文章をそのまま使用します。");
             return rawContent.strip();
