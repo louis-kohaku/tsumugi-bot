@@ -23,22 +23,11 @@ import java.util.logging.Logger;
 /**
  * 日記機能全体の組み立て・エントリーポイントを担うファサード。
  *
- * 【修正】要望部屋（🌼｜要望-ユーザー名）の取得・作成を、DiaryChannelService内での
- * チャンネル名一致判定に頼らず、DiaryRequestRoomRepositoryに保存した「既知のチャンネルID」
- * を介して行うように変更した。Discordのチャンネル名自動正規化により名前一致判定が
- * 失敗し、/日記実行や起動時バックフィルのたびに要望部屋が量産されていたバグへの対応。
+ * 【変更点】DiarySummaryGeneratorが必要とする最大トークン数（maxTokens）を、
+ * createDefault()の引数として外部（AppConfig / .envの LLM_MAX_TOKENS_DIARY）から
+ * 受け取り、DiarySummaryGeneratorのコンストラクタへそのまま渡すように変更した。
  *
- * あわせて、同一ユーザーに対するensureRequestRoomPersisted()の同時実行（多重作成）を
- * 防ぐため、userId単位のロックを設けた。
- *
- * 【変更なし】日記部屋へのアクセス集中対策として、セッション完了（最後の質問への回答）を
- * 受けた時点では要約生成をその場で行わず、diary_queue（SQL永続キュー）へ積むだけにした。
- * インメモリのDiarySessionはここで即座に破棄し、待機中のデータはSQLにのみ保持する。
- * 実際の生成処理はDiaryQueueWorkerがバックグラウンドで順番に行う。
- *
- * 要望部屋の作成は2経路ある（変更なし）:
- *  1. 新規ユーザーの名前確定時: InitialSetupServiceのonDisplayNameConfirmedコールバック経由
- *  2. 既存ユーザー分のバックフィル: bootstrapGuilds()で起動時にinitial_setupテーブルを走査
+ * それ以外のロジック（要望部屋のID永続化、diary_queue経由の非同期処理等）は変更なし。
  */
 public final class DiaryManager {
 
@@ -73,14 +62,17 @@ public final class DiaryManager {
      *                       呼び出し側（TsumugiApplication）で LlmLane.DIARY に紐づいた
      *                       LaneLlmClient を渡すこと。これにより「一度生成が始まったら
      *                       会話が来ても完了まで中断しない」という挙動がLaneLlmDispatcher側で保証される。
+     * @param maxTokens      日記総評生成に使う最大トークン数。
+     *                       AppConfig.llmMaxTokensDiary（.envの LLM_MAX_TOKENS_DIARY）を渡すこと。
      */
     public static DiaryManager createDefault(SqliteConnectionFactory connectionFactory,
                                                LlmClient diaryLlmClient,
-                                               InitialSetupRepository initialSetupRepository) {
+                                               InitialSetupRepository initialSetupRepository,
+                                               int maxTokens) {
         DiaryRepository repository = new SqliteDiaryRepository(connectionFactory);
         DiaryQueueRepository queueRepository = new SqliteDiaryQueueRepository(connectionFactory);
         DiaryRequestRoomRepository requestRoomRepository = new SqliteDiaryRequestRoomRepository(connectionFactory);
-        DiarySummaryGenerator summaryGenerator = new DiarySummaryGenerator(diaryLlmClient);
+        DiarySummaryGenerator summaryGenerator = new DiarySummaryGenerator(diaryLlmClient, maxTokens);
         DiaryService service = new DiaryService(repository, summaryGenerator);
         DiaryChannelService channelService = new DiaryChannelService();
         DiaryQueueWorker queueWorker = new DiaryQueueWorker(queueRepository, service, channelService);
