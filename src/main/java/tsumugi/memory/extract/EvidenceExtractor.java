@@ -19,6 +19,10 @@ import java.util.logging.Logger;
  *
  * 抽出結果は「何もない」ことの方が多い（雑談の大半はEvidenceを含まない）ため、
  * LLMには「該当なしなら空配列」を明示的に指示する。
+ *
+ * 【変更点】抽出呼び出しの最大トークン数（旧: 呼び出し箇所に 800 を直書き）を、
+ * コンストラクタ引数として外部（AppConfig / .envの LLM_MAX_TOKENS_EVIDENCE）から
+ * 注入する形に変更した。
  */
 public final class EvidenceExtractor {
 
@@ -47,9 +51,13 @@ public final class EvidenceExtractor {
     private final LlmClient llmClient;
     private final MemoryConsolidator consolidator;
 
-    public EvidenceExtractor(LlmClient llmClient, MemoryConsolidator consolidator) {
+    /** Evidence抽出呼び出しに使う最大トークン数。AppConfig.llmMaxTokensEvidence（.envの LLM_MAX_TOKENS_EVIDENCE）から注入される。 */
+    private final int maxTokens;
+
+    public EvidenceExtractor(LlmClient llmClient, MemoryConsolidator consolidator, int maxTokens) {
         this.llmClient = llmClient;
         this.consolidator = consolidator;
+        this.maxTokens = maxTokens;
     }
 
     /**
@@ -59,7 +67,7 @@ public final class EvidenceExtractor {
     public void extractAndConsolidate(long userId, String sourceEventId, String userText) {
         if (userText == null || userText.isBlank()) return;
 
-        String raw = llmClient.call(SYSTEM_PROMPT, userText, 800, 0.2);
+        String raw = llmClient.call(SYSTEM_PROMPT, userText, maxTokens, 0.2);
         if (raw == null || raw.isBlank()) {
             logger.fine("Evidence抽出: LLM応答が空でした (userId=" + userId + ")");
             return;

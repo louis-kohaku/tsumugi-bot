@@ -50,23 +50,31 @@ import java.util.logging.Logger;
 /**
  * 紬希の起動エントリーポイント。
  *
- * 【変更点: 強制退会機能の配線追加】
+ * 【今回の変更点: LLM最大トークン数の外部設定化】
+ * これまで各クラス（ConversationEngine / EvidenceExtractor / DiarySummaryGenerator /
+ * BroadcastReviewer）にハードコードされていたLLM呼び出しの最大トークン数（max_tokens）を、
+ * AppConfig経由で .env から読み込む形に変更した。
+ *
+ *   LLM_MAX_TOKENS_CHAT       … 通常会話（デフォルト800）
+ *   LLM_MAX_TOKENS_EVIDENCE   … Evidence抽出（デフォルト800）
+ *   LLM_MAX_TOKENS_DIARY      … 日記総評生成（デフォルト600）
+ *   LLM_MAX_TOKENS_BROADCAST  … お知らせ文校正（デフォルト800）
+ *
+ * 各コンポーネントの生成箇所（本ファイル内）で config.llmMaxTokensXxx を明示的に渡すよう
+ * コンストラクタ・createDefault()のシグネチャを変更している（対象4クラス＋DiaryManager／
+ * BroadcastManagerのファクトリメソッド）。
+ *
+ * 【既存: 強制退会機能の配線】
  * 管理者が対象者を選んで強制的に退会させる tsumugi.forcedwithdrawal パッケージを配線した。
  * InitialSetupManagerが既に持っている共有DB用InitialSetupRepository・InitialSetupChannelService、
  * および記憶層のEvidenceRepository・AnonymizedDataRepository・DataSubjectRightsServiceを
- * そのまま共有して組み立てる。JDA起動時のリスナー登録・bootstrapGuilds()呼び出し・
- * シャットダウンフックへの追加が主な変更点（他機能への変更は無し）。
+ * そのまま共有して組み立てる。
  *
- * 【既存: お知らせ配信機能の追加】
+ * 【既存: お知らせ配信機能】
  * Kohaku専用の「🌼｜お知らせ配信」チャンネルに投稿した内容をLLMで校正チェックし、
  * 確認（はい/いいえ、往復修正可）のうえで初期設定完了済み全ユーザーの
- * お知らせ部屋（announceChannelId）へ一斉配信する機能を追加した。
- * LLM呼び出しは新設のLlmLane.BROADCAST（CHATと同格の即時レーン、重量モデル使用）経由で行う。
- *
- * 【既存: 再入室時の引継ぎ確認（はい/いいえ）を実データに反映できるよう配線】
- * InitialSetupManager.createDefault() に、記憶層の各種Repository
- * （DataSubjectRightsService / EvidenceRepository / AnonymizedDataRepository）を
- * 渡すようにしている。
+ * お知らせ部屋（announceChannelId）へ一斉配信する機能。
+ * LLM呼び出しはLlmLane.BROADCAST（CHATと同格の即時レーン、重量モデル使用）経由で行う。
  *
  * 【既存: LM Studioへの問い合わせを1本のディスパッチャに集約】
  * 会話応答・Evidence抽出・日記の総評生成・お知らせ文チェックのLM Studio呼び出しは全て
@@ -86,6 +94,10 @@ public final class TsumugiApplication {
     public static void main(String[] args) throws Exception {
         AppConfig config = AppConfig.load();
         logger.info("紬希を起動します...");
+        logger.info("LLM最大トークン数設定: CHAT=" + config.llmMaxTokensChat
+                + " EVIDENCE=" + config.llmMaxTokensEvidence
+                + " DIARY=" + config.llmMaxTokensDiary
+                + " BROADCAST=" + config.llmMaxTokensBroadcast);
 
         // ── 共有DB（運用管理データ）のセットアップ ──────────
         Path sharedDbPath = Paths.get(config.dbPath);
@@ -184,20 +196,20 @@ public final class TsumugiApplication {
             runSmokeTest(consolidator, retriever);
         }
 
-        // ── 日記機能のセットアップ（要約生成はDIARYレーン） ──────────
+        // ── 日記機能のセットアップ（要約生成はDIARYレーン、トークン数はconfig.llmMaxTokensDiary） ──────────
         tsumugi.initialsetup.store.InitialSetupRepository initialSetupRepositoryForDiary =
                 new tsumugi.initialsetup.store.sqlite.SqliteInitialSetupRepository(sharedConnectionFactory);
         tsumugi.diary.DiaryManager diaryManager = tsumugi.diary.DiaryManager.createDefault(
-                sharedConnectionFactory, diaryLlm, initialSetupRepositoryForDiary);
+                sharedConnectionFactory, diaryLlm, initialSetupRepositoryForDiary, config.llmMaxTokensDiary);
         tsumugi.diary.DiaryListener diaryListener = new tsumugi.diary.DiaryListener(diaryManager);
 
         initialSetupManager.getService().setOnDisplayNameConfirmed(diaryManager::onMemberDisplayNameConfirmed);
 
-        // ── お知らせ配信機能のセットアップ（校正チェックはBROADCASTレーン） ──────────
+        // ── お知らせ配信機能のセットアップ（校正チェックはBROADCASTレーン、トークン数はconfig.llmMaxTokensBroadcast） ──────────
         tsumugi.initialsetup.store.InitialSetupRepository initialSetupRepositoryForBroadcast =
                 new tsumugi.initialsetup.store.sqlite.SqliteInitialSetupRepository(sharedConnectionFactory);
         BroadcastManager broadcastManager = BroadcastManager.createDefault(
-                sharedConnectionFactory, broadcastLlm, initialSetupRepositoryForBroadcast);
+                sharedConnectionFactory, broadcastLlm, initialSetupRepositoryForBroadcast, config.llmMaxTokensBroadcast);
         BroadcastListener broadcastListener = new BroadcastListener(broadcastManager);
 
         // ── 強制退会機能のセットアップ ────────────────────
@@ -215,10 +227,11 @@ public final class TsumugiApplication {
                 dataSubjectRightsService);
         ForcedWithdrawalListener forcedWithdrawalListener = new ForcedWithdrawalListener(forcedWithdrawalManager);
 
-        // ── 会話エンジン（CHATレーン）・Evidence抽出層（HEAVYレーン）のセットアップ ──
+        // ── 会話エンジン（CHATレーン、トークン数はconfig.llmMaxTokensChat）
+        //    ・Evidence抽出層（HEAVYレーン、トークン数はconfig.llmMaxTokensEvidence）のセットアップ ──
         ConversationEngine conversationEngine = new ConversationEngine(
-                chatLlm, retriever, episodicEventRepository, userModelRepository);
-        EvidenceExtractor evidenceExtractor = new EvidenceExtractor(heavyLlm, consolidator);
+                chatLlm, retriever, userModelRepository, episodicEventRepository, config.llmMaxTokensChat);
+        EvidenceExtractor evidenceExtractor = new EvidenceExtractor(heavyLlm, consolidator, config.llmMaxTokensEvidence);
 
         // ── Discordアダプタの起動 ─────────────────────
         if (config.discordToken.isBlank()) {

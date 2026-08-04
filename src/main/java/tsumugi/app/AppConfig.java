@@ -30,6 +30,13 @@ public final class AppConfig {
     // この配下に「表示名+登録日時」フォルダを1ユーザー1つ作る想定。
     private static final String DEFAULT_USER_DB_DIR = "data/users";
 
+    // LLM呼び出しの最大トークン数のデフォルト値
+    // （.envで未指定の場合に使う。従来コード内にハードコードされていた値をそのまま踏襲）。
+    private static final int DEFAULT_MAX_TOKENS_CHAT = 800;
+    private static final int DEFAULT_MAX_TOKENS_EVIDENCE = 800;
+    private static final int DEFAULT_MAX_TOKENS_DIARY = 600;
+    private static final int DEFAULT_MAX_TOKENS_BROADCAST = 800;
+
     public final String discordToken;
     public final String lmStudioBaseUrl;
 
@@ -48,6 +55,18 @@ public final class AppConfig {
     public final String userDbDir;
     public final String sqliteVecExtensionPath;
 
+    /** 通常会話の応答生成に使う最大トークン数。 .envの LLM_MAX_TOKENS_CHAT で上書き可能。 */
+    public final int llmMaxTokensChat;
+
+    /** Evidence抽出（性格・感情等の分析）に使う最大トークン数。 .envの LLM_MAX_TOKENS_EVIDENCE で上書き可能。 */
+    public final int llmMaxTokensEvidence;
+
+    /** 日記の総評生成に使う最大トークン数。 .envの LLM_MAX_TOKENS_DIARY で上書き可能。 */
+    public final int llmMaxTokensDiary;
+
+    /** お知らせ文の校正チェックに使う最大トークン数。 .envの LLM_MAX_TOKENS_BROADCAST で上書き可能。 */
+    public final int llmMaxTokensBroadcast;
+
     private AppConfig(Dotenv env) {
         this.discordToken = env.get("DISCORD_TOKEN", "");
         this.lmStudioBaseUrl = env.get("LM_STUDIO_BASE_URL", "http://localhost:1234");
@@ -57,6 +76,22 @@ public final class AppConfig {
         this.dbPath = resolveDbPath(env);
         this.userDbDir = env.get("TSUMUGI_USER_DB_DIR", DEFAULT_USER_DB_DIR);
         this.sqliteVecExtensionPath = env.get("SQLITE_VEC_EXTENSION_PATH", "");
+
+        this.llmMaxTokensChat = parseIntOrDefault(env.get("LLM_MAX_TOKENS_CHAT"), DEFAULT_MAX_TOKENS_CHAT);
+        this.llmMaxTokensEvidence = parseIntOrDefault(env.get("LLM_MAX_TOKENS_EVIDENCE"), DEFAULT_MAX_TOKENS_EVIDENCE);
+        this.llmMaxTokensDiary = parseIntOrDefault(env.get("LLM_MAX_TOKENS_DIARY"), DEFAULT_MAX_TOKENS_DIARY);
+        this.llmMaxTokensBroadcast = parseIntOrDefault(env.get("LLM_MAX_TOKENS_BROADCAST"), DEFAULT_MAX_TOKENS_BROADCAST);
+    }
+
+    /** 数値として解釈できない・未設定の場合はデフォルト値にフォールバックする。 */
+    private static int parseIntOrDefault(String raw, int defaultValue) {
+        if (raw == null || raw.isBlank()) return defaultValue;
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            logger.warning("トークン数設定の解析に失敗したためデフォルト値(" + defaultValue + ")を使用します: " + raw);
+            return defaultValue;
+        }
     }
 
     /**
