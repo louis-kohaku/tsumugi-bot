@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration scan="true" scanPeriod="30 seconds">
+
+    <!-- ═══════════════════════════════════════
+         共通プロパティ
+         ═══════════════════════════════════════ -->
+    <property name="LOG_DIR" value="logs" />
+    <property name="CONSOLE_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %highlight(%-5level) [%thread] %cyan(%logger{36}) - %msg%n" />
+    <property name="FILE_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n" />
+
+    <!-- ═══════════════════════════════════════
+         Appender: コンソール
+         ═══════════════════════════════════════ -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${CONSOLE_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ═══════════════════════════════════════
+         Appender: ファイル出力（日次ローテーション・30日保持）
+         今は未使用でもよい。有効化する場合は下の <root> に追記する。
+         ═══════════════════════════════════════ -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/app.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/app.%d{yyyy-MM-dd}.log.gz</fileNamePattern>
+            <maxHistory>30</maxHistory>
+            <totalSizeCap>1GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${FILE_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ═══════════════════════════════════════
+         Appender: エラー専用ファイル（WARN以上のみ、常時有効推奨）
+         障害調査時に「エラーだけ」を素早く追える
+         ═══════════════════════════════════════ -->
+    <appender name="ERROR_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>WARN</level>
+        </filter>
+        <file>${LOG_DIR}/error.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/error.%d{yyyy-MM-dd}.log.gz</fileNamePattern>
+            <maxHistory>60</maxHistory>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${FILE_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ═══════════════════════════════════════
+         Logger: アプリケーション本体
+         開発中はDEBUGで細かく追えるようにする
+         ═══════════════════════════════════════ -->
+    <logger name="tsumugi" level="DEBUG" additivity="false">
+        <appender-ref ref="CONSOLE" />
+        <appender-ref ref="ERROR_FILE" />
+        <!-- ファイル出力を有効化する場合はコメントアウトを外す -->
+        <!-- <appender-ref ref="FILE" /> -->
+    </logger>
+
+    <!-- ═══════════════════════════════════════
+         Logger: 外部ライブラリのノイズ抑制
+         ═══════════════════════════════════════ -->
+    <logger name="net.dv8tion.jda" level="INFO" />
+    <logger name="okhttp3" level="WARN" />
+    <logger name="org.sqlite" level="WARN" />
+
+    <!-- ═══════════════════════════════════════
+         Root logger
+         ═══════════════════════════════════════ -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE" />
+        <appender-ref ref="ERROR_FILE" />
+    </root>
+
+</configuration>
