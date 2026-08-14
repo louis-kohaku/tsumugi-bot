@@ -61,6 +61,16 @@ import java.util.logging.Logger;
  *         元データ（会話履歴・Evidence・UserModel）はDataSubjectRightsService.forgetUser()
  *         で削除する。会話ログ（EpisodicEvent）は匿名化せず削除のみ（退会フローと同方針）。
  *       - withdrawalレコードを削除したうえで、通常の新規フロー（WAITING_NAME）へ切り替える。
+ *
+ * 【追加】既存ユーザーの救済（バックフィル）:
+ *   Bot導入前から在籍していた等の理由で、実際には会話している（EpisodicEventがある）のに
+ *   initial_setupがCOMPLETEDまで進んでいないユーザーが存在することが判明した
+ *   （お知らせ配信がCOMPLETEDユーザーのみを対象にしているため、この状態のユーザーには
+ *   配信が届かない・庭も作られない、という不整合を引き起こしていた）。
+ *   backfillLegacyUser() は、そうしたユーザーを検知した際に、現在のDiscord表示名を
+ *   そのまま使って通常の利用規約同意フロー（WAITING_CONSENT）に乗せることで救済する。
+ *   同意の取得自体は省略しない（法務上の同意記録は必須のため）。
+ *   呼び出し元はInitialSetupManager.runLegacyBackfill()を想定。
  */
 public final class InitialSetupService {
     private volatile java.util.function.Consumer<Member> onDisplayNameConfirmed;
@@ -147,6 +157,39 @@ public final class InitialSetupService {
         transition(record, InitialSetupState.WAITING_NAME);
     }
 
+    // ═══════════════════════════════════════
+    //  既存ユーザーの救済（バックフィル）
+    // ═══════════════════════════════════════
+
+    /**
+     * 既に会話履歴（EpisodicEvent）があるにもかかわらず、初期設定がCOMPLETEDまで
+     * 進んでいない（NOT_STARTED/WAITING_NAMEのまま止まっている）ユーザーを救済する。
+     *
+     * 呼び出し前提: 呼び出し元（InitialSetupManager.runLegacyBackfill）が、
+     * 対象ユーザーに実際の会話履歴があることを事前に確認していること。
+     * それ以外の状態（WAITING_CONSENT等、既に手続きが進行中）のユーザーには何もしない
+     * （二重にチャンネルを作らないための安全策）。
+     *
+     * 現在のDiscord表示名（member.getEffectiveName()）をそのまま「読んでほしい名前」として使い、
+     * 通常の名前入力後と同じ利用規約同意フロー（WAITING_CONSENT）へ進める。
+     * 同意の取得自体はスキップしない（法務上の同意記録が必須のため）。
+     */
+    public void backfillLegacyUser(Member member) {
+        Guild guild = member.getGuild();
+        InitialSetupRecord record = repository.load(member.getIdLong(), guild.getIdLong());
+        if (record.state != InitialSetupState.NOT_STARTED && record.state != InitialSetupState.WAITING_NAME) {
+            logger.fine("既に初期設定が進行/完了しているため、救済処理をスキップします: userId="
+                    + member.getIdLong() + " state=" + record.state);
+            return;
+        }
+
+        record.displayName = member.getEffectiveName();
+        startConsentFlow(guild, member, record);
+
+        logger.info("既存ユーザーの救済処理として利用規約同意フローを開始しました: userId=" + member.getIdLong()
+                + " displayName=" + record.displayName);
+    }
+
     /**
      * 入室チャンネルに投稿されたメッセージを名前入力として処理する。
      * WAITING_NAME以外の状態のユーザーからの投稿は無視する（呼び出し側でも判定するが、二重チェック）。
@@ -179,7 +222,7 @@ public final class InitialSetupService {
 
     /**
      * 利用規約同意チャンネルを作成し、WAITING_CONSENTへ遷移して1分のタイムアウトを仕込む。
-     * 通常の名前入力後・再入室の引継ぎ「はい」回答後の両方から呼ばれる。
+     * 通常の名前入力後・再入室の引継ぎ「はい」回答後・既存ユーザー救済の3経路から呼ばれる。
      * 呼び出し前提として、record.displayNameは設定済みであること。
      */
     private void startConsentFlow(Guild guild, Member member, InitialSetupRecord record) {
@@ -277,7 +320,7 @@ public final class InitialSetupService {
     /**
      * 庭チャンネルを作成し、recordに反映してCOMPLETEDへ遷移する共通処理。
      * ユーザー用DBフォルダの割り当て/リネームもここで行う
-     * （通常の同意完了・引継ぎ確認完了の両方から呼ばれるため）。
+     * （通常の同意完了・引継ぎ確認完了・既存ユーザー救済の3経路から呼ばれるため）。
      */
     private void buildGardenAndComplete(Guild guild, Member member, InitialSetupRecord record, String displayName) {
         userDbRegistry.renameUser(member.getIdLong(), displayName);
@@ -290,7 +333,7 @@ public final class InitialSetupService {
 
         transition(record, InitialSetupState.COMPLETED);
 
-        // 名前確定（新規入室・引継ぎ確認完了の両方）を機能横断で通知する
+        // 名前確定（新規入室・引継ぎ確認完了・既存ユーザー救済の全て）を機能横断で通知する
         if (onDisplayNameConfirmed != null) {
             try {
                 onDisplayNameConfirmed.accept(member);

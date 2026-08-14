@@ -10,6 +10,9 @@ import tsumugi.conversation.ConversationEngine;
 import tsumugi.core.model.TsumugiModel.ChannelType;
 import tsumugi.core.model.TsumugiModel.EpisodicEvent;
 import tsumugi.core.model.TsumugiModel.Speaker;
+import tsumugi.initialsetup.InitialSetupState;
+import tsumugi.initialsetup.model.InitialSetupRecord;
+import tsumugi.initialsetup.store.InitialSetupRepository;
 import tsumugi.memory.extract.EvidenceExtractor;
 import tsumugi.memory.rights.DataSubjectRightsService;
 import tsumugi.memory.store.EpisodicEventRepository;
@@ -29,7 +32,20 @@ import java.util.logging.Logger;
  * 「忘れて」を含む発話をトリガーとしてDataSubjectRightsService.forgetUser()を呼び出す。
  * ※簡易な文字列一致によるトリガーであり、誤爆防止のため確認メッセージを挟む2段階方式とする。
  *
- * 【変更点】Evidence抽出（性格・感情等の分析）は、以前は応答生成の直後に同期で実行していたが、
+ * 【今回の変更点: 初期設定未完了ユーザーの通常会話ブロック】
+ * これまでは🌼｜プレフィックスのシステムチャンネル以外であれば、初期設定
+ * （InitialSetupState）の状態を一切見ずに誰の発言にも応答していた。
+ * これにより、Bot導入前から在籍していた等の理由でinitial_setupがCOMPLETEDまで
+ * 進んでいないユーザーでも普通に会話でき、EpisodicEvent/Evidenceが積まれる一方、
+ * お知らせ配信（InitialSetupState.COMPLETEDでフィルタ）が届かない・庭が無い、
+ * という不整合を引き起こしていた。
+ *
+ * この変更により、ギルド内のメッセージについては、送信者のInitialSetupStateが
+ * COMPLETEDでない場合は通常の会話処理を行わず、入室チャンネルでの初期設定を促す
+ * 案内メッセージのみを返すようにした。DM（isFromGuild()==false）はギルド単位の
+ * 初期設定という概念に馴染まないため、従来通り常に処理する。
+ *
+ * 【既存の変更点】Evidence抽出（性格・感情等の分析）は、以前は応答生成の直後に同期で実行していたが、
  * これをやめて「応答送信後、30秒後にEvidence抽出用の投入専用スレッドへ回す」方式に変更した。
  * 理由:
  *  - Evidence抽出はLlmLane.HEAVYで実行され、LaneLlmDispatcher側で「会話が一定時間アイドルに
@@ -53,6 +69,11 @@ public final class DiscordAdapter extends ListenerAdapter {
     private static final String FORGET_DONE_REPLY =
             "これまでの記憶を削除しました。次にお話しするときは、また一からよろしくお願いします。";
 
+    /** 初期設定未完了ユーザーが通常チャンネルで話しかけてきた際の案内メッセージ。 */
+    private static final String SETUP_REQUIRED_REPLY =
+            "ごめんなさい、まだ初期設定が完了していないようです。"
+            + "🌼｜入室チャンネルで初期設定を済ませてから、またお話しかけてくださいね😊";
+
     /** Evidence抽出を応答送信からどれだけ遅らせて投入するか。 */
     private static final long EVIDENCE_EXTRACT_DELAY_SECONDS = 30;
 
@@ -60,6 +81,10 @@ public final class DiscordAdapter extends ListenerAdapter {
     private final EpisodicEventRepository episodicEventRepository;
     private final EvidenceExtractor evidenceExtractor;
     private final DataSubjectRightsService dataSubjectRightsService;
+
+    /** 送信者のInitialSetupStateを確認するために使う。ギルド内メッセージのゲート判定にのみ使用する。 */
+    private final InitialSetupRepository initialSetupRepository;
+
     private final ExecutorService workerPool = Executors.newFixedThreadPool(4);
 
     /** Evidence抽出の「投入」だけを行う専用スレッド。ここがHEAVYレーンの順番待ちでブロックされても会話には影響しない。 */
@@ -73,11 +98,13 @@ public final class DiscordAdapter extends ListenerAdapter {
     public DiscordAdapter(ConversationEngine conversationEngine,
                            EpisodicEventRepository episodicEventRepository,
                            EvidenceExtractor evidenceExtractor,
-                           DataSubjectRightsService dataSubjectRightsService) {
+                           DataSubjectRightsService dataSubjectRightsService,
+                           InitialSetupRepository initialSetupRepository) {
         this.conversationEngine = conversationEngine;
         this.episodicEventRepository = episodicEventRepository;
         this.evidenceExtractor = evidenceExtractor;
         this.dataSubjectRightsService = dataSubjectRightsService;
+        this.initialSetupRepository = initialSetupRepository;
     }
 
     /** JDAを起動し、このアダプタをリスナーとして登録する。呼び出し側がJDAのライフサイクルを管理する。 */
@@ -118,13 +145,20 @@ public final class DiscordAdapter extends ListenerAdapter {
         if (text == null || text.isBlank()) return;
 
         long userId = event.getAuthor().getIdLong();
+        Long guildId = event.isFromGuild() ? event.getGuild().getIdLong() : null;
         MessageChannel channel = event.getChannel();
 
-        workerPool.submit(() -> handle(userId, text, channel));
+        workerPool.submit(() -> handle(userId, guildId, text, channel));
     }
 
-    private void handle(long userId, String text, MessageChannel channel) {
+    private void handle(long userId, Long guildId, String text, MessageChannel channel) {
         try {
+            // ギルド内メッセージのみ、初期設定完了状態でゲートする（DMはこの概念に馴染まないため対象外）。
+            if (guildId != null && !isSetupCompleted(userId, guildId)) {
+                channel.sendMessage(SETUP_REQUIRED_REPLY).queue();
+                return;
+            }
+
             // 削除権（忘れられる権利）対応: 確定ワードを含む場合は即削除して通常の会話処理をスキップする
             if (text.contains(FORGET_CONFIRM_KEYWORD)) {
                 dataSubjectRightsService.forgetUser(userId);
@@ -172,6 +206,12 @@ public final class DiscordAdapter extends ListenerAdapter {
             logger.warning("メッセージ処理中にエラーが発生しました (userId=" + userId + "): " + e.getMessage());
             channel.sendMessage("エラーが発生しました。少し時間をおいて、もう一度お試しください。").queue();
         }
+    }
+
+    /** 指定ユーザー・ギルドの初期設定がCOMPLETEDかどうかを判定する。 */
+    private boolean isSetupCompleted(long userId, long guildId) {
+        InitialSetupRecord record = initialSetupRepository.load(userId, guildId);
+        return record.state == InitialSetupState.COMPLETED;
     }
 
     public void shutdown() {
