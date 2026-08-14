@@ -3,6 +3,7 @@ package tsumugi.initialsetup;
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.entities.Guild;
 import net.dv8tion.jda.api.entities.Member;
+import tsumugi.initialsetup.model.InitialSetupRecord;
 import tsumugi.initialsetup.store.InitialSetupRepository;
 import tsumugi.initialsetup.store.sqlite.SqliteInitialSetupRepository;
 import tsumugi.membership.MembershipManager;
@@ -10,6 +11,7 @@ import tsumugi.membership.store.MembershipRepository;
 import tsumugi.membership.store.sqlite.SqliteMembershipRepository;
 import tsumugi.memory.anonymized.AnonymizedDataRepository;
 import tsumugi.memory.rights.DataSubjectRightsService;
+import tsumugi.memory.store.EpisodicEventRepository;
 import tsumugi.memory.store.EvidenceRepository;
 import tsumugi.memory.store.sqlite.SqliteConnectionFactory;
 import tsumugi.memory.store.sqlite.UserConnectionFactoryRegistry;
@@ -31,6 +33,20 @@ import java.util.logging.Logger;
  * EvidenceRepository・AnonymizedDataRepositoryを渡すようにした。
  * いずれも記憶層・退会機能が既に持っているインスタンスをそのまま共有する
  * （TsumugiApplication側で同じインスタンスを渡すこと）。
+ *
+ * 【今回の変更点: 既存ユーザーの救済（バックフィル）】
+ * Bot導入前から在籍していた等の理由で、実際には会話履歴（EpisodicEvent）があるのに
+ * initial_setupがCOMPLETEDまで進んでいないユーザーが存在する不具合が判明した。
+ * これにより、お知らせ配信（InitialSetupState.COMPLETEDでフィルタ）が届かない・
+ * 庭（announceChannelId等）が作られない、という問題が起きていた。
+ *
+ * runLegacyBackfill() を追加し、Bot起動時に「初期設定がCOMPLETED/WAITING_NAMEより
+ * 先に進んでいない」かつ「過去に発話履歴がある」ユーザーを検出したうえで、
+ * InitialSetupService.backfillLegacyUser() を呼び、通常の利用規約同意フローに乗せる
+ * （同意の取得自体は省略しない）。
+ * この検出にはEpisodicEventRepositoryが必要なため、TsumugiApplication側から
+ * bootstrapGuilds()とは別にrunLegacyBackfill()を呼んでもらう構成とした
+ * （InitialSetupManagerの他のコンストラクタ引数を増やさずに済むようにするため）。
  */
 public final class InitialSetupManager {
 
@@ -119,6 +135,50 @@ public final class InitialSetupManager {
                     logger.warning("既存メンバーの初期設定準備に失敗しました (userId=" + member.getIdLong() + "): " + e.getMessage());
                 }
             }
+        }
+    }
+
+    /**
+     * 【今回追加】Bot起動完了直後、bootstrapGuilds()の後に呼ぶ。
+     *
+     * 「初期設定がCOMPLETED/WAITING_NAMEより先に進んでいない」かつ
+     * 「過去に発話履歴（EpisodicEvent）がある」ユーザーを全ギルド横断で検出し、
+     * InitialSetupService.backfillLegacyUser()で救済する（利用規約同意フローに乗せる）。
+     *
+     * 既に会話がある＝実質的に紬希を使っているユーザーのみを対象とすることで、
+     * 単にまだ入室チャンネルで名前を入力していないだけの「本当に新しい」ユーザーの
+     * オンボーディング体験（自分で名前を入力してもらう）には影響を与えないようにしている。
+     *
+     * @param episodicEventRepository 発話履歴の有無を確認するために使う
+     *                                （TsumugiApplication側で記憶層と同じインスタンスを渡すこと）
+     */
+    public void runLegacyBackfill(JDA jda, EpisodicEventRepository episodicEventRepository) {
+        int backfilledCount = 0;
+        for (Guild guild : jda.getGuilds()) {
+            for (Member member : guild.getMembers()) {
+                if (member.getUser().isBot()) continue;
+                try {
+                    InitialSetupRecord record = service.getRecord(member.getIdLong(), guild.getIdLong());
+                    if (record.state != InitialSetupState.NOT_STARTED
+                            && record.state != InitialSetupState.WAITING_NAME) {
+                        continue; // 既に手続きが進行中/完了済みなので対象外
+                    }
+
+                    boolean hasChatted = !episodicEventRepository.loadRecent(member.getIdLong(), 1).isEmpty();
+                    if (!hasChatted) continue; // 本当に未接触の新規ユーザーは通常フローに任せる
+
+                    service.backfillLegacyUser(member);
+                    backfilledCount++;
+                } catch (RuntimeException e) {
+                    logger.warning("既存ユーザーの救済処理に失敗しました (userId=" + member.getIdLong() + "): " + e.getMessage());
+                }
+            }
+        }
+        if (backfilledCount > 0) {
+            logger.info("既存ユーザーの救済処理（バックフィル）を実行しました: 対象件数=" + backfilledCount
+                    + "（各対象者に利用規約同意チャンネルを作成しました）");
+        } else {
+            logger.info("既存ユーザーの救済処理（バックフィル）: 対象者はいませんでした。");
         }
     }
 

@@ -50,22 +50,33 @@ import java.util.logging.Logger;
 /**
  * 紬希の起動エントリーポイント。
  *
- * 【今回の変更点: LLM最大トークン数の外部設定化】
+ * 【今回の変更点: 初期設定未完了ユーザーの救済（バックフィル）＋通常会話のブロック】
+ * Bot導入前から在籍していた等の理由で、実際には会話履歴があるのに
+ * initial_setupがCOMPLETEDまで進んでいないユーザーが存在し、お知らせ配信
+ * （InitialSetupState.COMPLETEDでフィルタ）が届かない・庭が無い、という不整合が
+ * 起きていた問題への対応として、以下の2点を追加した。
+ *
+ *   1. DiscordAdapterに InitialSetupRepository を注入し、ギルド内のメッセージについては
+ *      送信者のInitialSetupStateがCOMPLETEDでない限り通常会話をブロックし、初期設定を
+ *      促す案内を返すようにした（DiscordAdapterのコンストラクタ引数が1つ増えている）。
+ *   2. InitialSetupManager.bootstrapGuilds(jda) の直後に
+ *      initialSetupManager.runLegacyBackfill(jda, episodicEventRepository) を呼び、
+ *      「初期設定がCOMPLETED/WAITING_NAMEより先に進んでいない」かつ「過去に発話履歴がある」
+ *      ユーザーを検出して、通常の利用規約同意フローに自動的に乗せるようにした
+ *      （同意の取得自体は省略しない）。
+ *
+ * 【既存: LLM最大トークン数の外部設定化】
  * これまで各クラス（ConversationEngine / EvidenceExtractor / DiarySummaryGenerator /
  * BroadcastReviewer）にハードコードされていたLLM呼び出しの最大トークン数（max_tokens）を、
- * AppConfig経由で .env から読み込む形に変更した。
+ * AppConfig経由で .env から読み込む形に変更している。
  *
  *   LLM_MAX_TOKENS_CHAT       … 通常会話（デフォルト800）
  *   LLM_MAX_TOKENS_EVIDENCE   … Evidence抽出（デフォルト800）
  *   LLM_MAX_TOKENS_DIARY      … 日記総評生成（デフォルト600）
  *   LLM_MAX_TOKENS_BROADCAST  … お知らせ文校正（デフォルト800）
  *
- * 各コンポーネントの生成箇所（本ファイル内）で config.llmMaxTokensXxx を明示的に渡すよう
- * コンストラクタ・createDefault()のシグネチャを変更している（対象4クラス＋DiaryManager／
- * BroadcastManagerのファクトリメソッド）。
- *
  * 【既存: 強制退会機能の配線】
- * 管理者が対象者を選んで強制的に退会させる tsumugi.forcedwithdrawal パッケージを配線した。
+ * 管理者が対象者を選んで強制的に退会させる tsumugi.forcedwithdrawal パッケージを配線している。
  * InitialSetupManagerが既に持っている共有DB用InitialSetupRepository・InitialSetupChannelService、
  * および記憶層のEvidenceRepository・AnonymizedDataRepository・DataSubjectRightsServiceを
  * そのまま共有して組み立てる。
@@ -140,6 +151,12 @@ public final class TsumugiApplication {
                 evidenceRepository,
                 anonymizedDataRepository);
         InitialSetupListener initialSetupListener = new InitialSetupListener(initialSetupManager);
+
+        // DiscordAdapterの会話ゲート（初期設定未完了ユーザーのブロック）に使う。
+        // initialSetupManager内部のRepositoryとは別インスタンスだが、同じ共有DB・同じテーブルを
+        // 指すため実質的に同じ状態を参照する（他のRepository群と同じ方針。SqliteInitialSetupRepository参照）。
+        tsumugi.initialsetup.store.InitialSetupRepository initialSetupRepositoryForChatGate =
+                new tsumugi.initialsetup.store.sqlite.SqliteInitialSetupRepository(sharedConnectionFactory);
 
         // ── LLM連携層のセットアップ ────────────────────
         OkHttpClient httpClient = new OkHttpClient.Builder()
@@ -248,10 +265,12 @@ public final class TsumugiApplication {
         }
 
         DiscordAdapter adapter = new DiscordAdapter(
-                conversationEngine, episodicEventRepository, evidenceExtractor, dataSubjectRightsService);
+                conversationEngine, episodicEventRepository, evidenceExtractor, dataSubjectRightsService,
+                initialSetupRepositoryForChatGate);
         JDA jda = DiscordAdapter.start(config.discordToken, adapter,
                 initialSetupListener, withdrawalListener, diaryListener, broadcastListener, forcedWithdrawalListener);
         initialSetupManager.bootstrapGuilds(jda);
+        initialSetupManager.runLegacyBackfill(jda, episodicEventRepository); // 既存ユーザーの救済（バックフィル）
         withdrawalManager.ensureWithdrawalRequestChannelsForAllGuilds(jda);
         diaryManager.bootstrapGuilds(jda); // ここでdiary_queueワーカーも起動する
         broadcastManager.bootstrapGuilds(jda); // お知らせ配信チャンネルの存在保証
